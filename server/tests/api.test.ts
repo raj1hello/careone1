@@ -355,7 +355,7 @@ describe('CareOne Backend API, Security & Cross-Portal Workflows', () => {
     });
     assert.equal(badPayload.status, 400);
 
-    // Without GEMINI_API_KEY configured in test env, backend must return 503 with configured: false (no mock AI)
+    // Without GEMINI_API_KEY configured in test env, backend must return 503 instead of mocked AI responses
     const prevKey = process.env.GEMINI_API_KEY;
     delete process.env.GEMINI_API_KEY;
     try {
@@ -367,6 +367,7 @@ describe('CareOne Backend API, Security & Cross-Portal Workflows', () => {
       assert.equal(noKeyRes.status, 503);
       assert.equal(noKeyRes.data.configured, false);
       assert.equal(noKeyRes.data.endpoint, '/api/ai/assistant');
+      assert.ok(noKeyRes.data.error);
     } finally {
       if (prevKey !== undefined) process.env.GEMINI_API_KEY = prevKey;
     }

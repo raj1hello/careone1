@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import {
   Activity,
   Bell,
+  BellRing,
   CheckCheck,
   ChevronLeft,
   ChevronRight,
@@ -11,22 +12,20 @@ import {
   X,
   type LucideIcon,
 } from 'lucide-react';
-import { api } from '../services/api.ts';
 import { useAuthStore } from '../store/authStore.ts';
+import {
+  formatTimestamp,
+  markAllNotificationsRead,
+  markNotificationRead,
+  subscribeNotifications,
+  type NotificationDoc,
+} from '../services/careoneDb.ts';
+import { enablePushNotifications } from '../lib/firebase.ts';
 
 export interface NavItem {
   id: string;
   label: string;
   icon: LucideIcon;
-}
-
-interface NotificationItem {
-  id: number;
-  title: string;
-  message: string;
-  category: string;
-  is_read: number;
-  created_at: string;
 }
 
 interface PortalLayoutProps {
@@ -59,38 +58,33 @@ export function PortalLayout({
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
-  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
-  const [unreadCount, setUnreadCount] = useState(0);
+  const [notifications, setNotifications] = useState<NotificationDoc[]>([]);
+  const [pushNotice, setPushNotice] = useState('');
 
   const isObs = theme === 'observatory';
   const isHosp = theme === 'hospital';
 
-  const loadNotifications = async () => {
-    try {
-      const res = await api.get('/notifications');
-      setNotifications(res.data.notifications || []);
-      setUnreadCount(res.data.unreadCount || 0);
-    } catch {
-      // Ignore transient errors
-    }
-  };
-
   useEffect(() => {
-    loadNotifications();
-    const timer = setInterval(loadNotifications, 20000);
-    return () => clearInterval(timer);
-  }, []);
+    if (!user?.uid) return;
+    const unsub = subscribeNotifications(user.uid, (items) => {
+      setNotifications(items);
+    });
+    return () => unsub();
+  }, [user?.uid]);
+
+  const unreadCount = notifications.filter((n) => !n.isRead).length;
 
   const handleMarkAllRead = async () => {
-    await api.post('/notifications/read-all');
-    setNotifications((prev) => prev.map((n) => ({ ...n, is_read: 1 })));
-    setUnreadCount(0);
+    await markAllNotificationsRead(notifications);
   };
 
-  const handleMarkOneRead = async (id: number) => {
-    await api.patch(`/notifications/${id}/read`);
-    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: 1 } : n)));
-    setUnreadCount((c) => Math.max(0, c - 1));
+  const handleMarkOneRead = async (id: string) => {
+    await markNotificationRead(id);
+  };
+
+  const handleEnablePush = async () => {
+    const res = await enablePushNotifications();
+    setPushNotice(res.message);
   };
 
   const handleLogout = async () => {
@@ -227,7 +221,7 @@ export function PortalLayout({
           {!isNarrow && (
             <div className="min-w-0">
               <p className={`text-[13px] font-semibold truncate ${isObs ? 'text-white' : 'text-[#202124]'}`}>
-                {user?.full_name}
+                {user?.fullName}
               </p>
               <p className={`text-[11px] truncate ${isObs ? 'text-[#b0b3d6]' : 'text-[#777D87]'}`}>{user?.email}</p>
             </div>
@@ -322,10 +316,7 @@ export function PortalLayout({
 
             <button
               type="button"
-              onClick={() => {
-                setNotifOpen((v) => !v);
-                if (!notifOpen) loadNotifications();
-              }}
+              onClick={() => setNotifOpen((v) => !v)}
               className={`relative p-2 ${
                 isHosp ? 'hosp-btn-secondary' : isObs ? 'obs-btn-secondary' : 'mac-btn-secondary'
               }`}
@@ -355,15 +346,15 @@ export function PortalLayout({
                 title="Hospital Profile & Settings"
               >
                 <span className="w-6 h-6 rounded-md bg-[#16165c] text-white text-[11px] font-semibold flex items-center justify-center">
-                  {(portalSubtitle || user?.full_name || 'H').slice(0, 1).toUpperCase()}
+                  {(portalSubtitle || user?.fullName || 'H').slice(0, 1).toUpperCase()}
                 </span>
-                <span className="max-w-[140px] truncate">{portalSubtitle || user?.full_name}</span>
+                <span className="max-w-[140px] truncate">{portalSubtitle || user?.fullName}</span>
               </button>
             )}
 
             {notifOpen && (
               <div
-                className={`absolute right-0 top-12 w-80 sm:w-96 max-h-[26rem] flex flex-col p-0 z-50 overflow-hidden ${
+                className={`absolute right-0 top-12 w-80 sm:w-96 max-h-[28rem] flex flex-col p-0 z-50 overflow-hidden ${
                   isHosp
                     ? 'bg-white border border-[#E5E7EB] rounded-xl shadow-lg'
                     : isObs
@@ -377,7 +368,7 @@ export function PortalLayout({
                   }`}
                 >
                   <span className={`text-[13px] font-semibold ${isObs ? 'text-white' : 'text-[#202124]'}`}>
-                    Notifications
+                    Real-Time Notifications
                   </span>
                   <div className="flex items-center gap-3">
                     {hasNotificationsTab && (
@@ -396,31 +387,48 @@ export function PortalLayout({
                     )}
                     <button
                       type="button"
-                      onClick={handleMarkAllRead}
+                      onClick={() => void handleMarkAllRead()}
                       className={`inline-flex items-center gap-1 text-[12px] font-medium hover:underline ${
                         isHosp ? 'text-[#16165c]' : isObs ? 'text-[#00b1ff]' : 'text-[#0071e3]'
                       }`}
                     >
                       <CheckCheck className="w-3.5 h-3.5" />
-                      <span>Mark all read</span>
+                      <span>Mark read</span>
                     </button>
                   </div>
                 </div>
+
+                <div className="px-4 py-2 border-b border-[#E5E7EB] bg-[#F7F8FA] flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleEnablePush()}
+                    className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[#0071e3] hover:underline"
+                  >
+                    <BellRing className="w-3.5 h-3.5" />
+                    <span>Enable Browser Push (FCM)</span>
+                  </button>
+                </div>
+                {pushNotice && (
+                  <p className="px-4 py-2 text-[11px] text-[#6e6e73] bg-amber-50 border-b border-amber-100">
+                    {pushNotice}
+                  </p>
+                )}
+
                 <div className={`overflow-y-auto divide-y ${isObs ? 'divide-white/10' : 'divide-[#E5E7EB]'}`}>
                   {notifications.length === 0 ? (
                     <p className={`p-6 text-center text-[13px] ${isObs ? 'text-[#b0b3d6]' : 'text-[#777D87]'}`}>
-                      No notifications
+                      No notifications yet
                     </p>
                   ) : (
                     notifications.map((n) => (
                       <button
                         key={n.id}
                         type="button"
-                        onClick={() => handleMarkOneRead(n.id)}
+                        onClick={() => void handleMarkOneRead(n.id)}
                         className={`w-full text-left p-3.5 transition-colors ${
                           isObs
-                            ? `hover:bg-white/[0.06] ${n.is_read ? 'opacity-65' : 'bg-[#00b1ff]/10'}`
-                            : `hover:bg-[#F7F8FA] ${n.is_read ? 'opacity-65' : 'bg-[#5350cc]/[0.05]'}`
+                            ? `hover:bg-white/[0.06] ${n.isRead ? 'opacity-65' : 'bg-[#00b1ff]/10'}`
+                            : `hover:bg-[#F7F8FA] ${n.isRead ? 'opacity-65' : 'bg-[#5350cc]/[0.05]'}`
                         }`}
                       >
                         <div className="flex items-center justify-between gap-2">
@@ -428,7 +436,7 @@ export function PortalLayout({
                             {n.title}
                           </span>
                           <span className={`text-[11px] font-mono-tabular ${isObs ? 'text-[#b0b3d6]' : 'text-[#777D87]'}`}>
-                            {new Date(n.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            {formatTimestamp(n.createdAt)}
                           </span>
                         </div>
                         <p className={`text-[12px] mt-0.5 leading-snug ${isObs ? 'text-[#b0b3d6]' : 'text-[#777D87]'}`}>

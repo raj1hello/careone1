@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Activity,
@@ -6,92 +6,70 @@ import {
   BedDouble,
   Building2,
   Pill,
+  ShieldCheck,
+  Sparkles,
   Stethoscope,
   UserRound,
+  Video,
 } from 'lucide-react';
-import { api } from '../services/api.ts';
 import { useAuthStore } from '../store/authStore.ts';
-
-interface PlatformHealth {
-  verified_doctors: number;
-  verified_hospitals: number;
-  verified_pharmacies: number;
-  available_beds: number;
-}
 
 const PORTAL_TABS = [
   {
     id: 'patient',
     label: 'Patient',
     icon: UserRound,
-    metricLabel: 'Verified Doctors',
+    headline: 'AI intake, doctor discovery & day-wise medicine tracking',
     items: [
-      'Search doctors by specialty and hospital',
-      'Book slots and join VidDoc video calls',
-      'Access prescriptions, lab records, and orders',
+      'Start with Gemini AI symptom intake & specialist matching',
+      'Book verified doctors for VidDoc video or in-person visits',
+      'Track authorized prescriptions & daily medicine doses',
     ],
   },
   {
     id: 'doctor',
     label: 'Doctor',
     icon: Stethoscope,
-    metricLabel: 'Hospitals',
+    headline: 'Verified clinical practice, WebRTC VidDoc & AI summaries',
     items: [
-      'Manage appointment requests and schedules',
-      'Conduct WebRTC VidDoc calls with live vitals',
-      'Issue multi-item digital prescriptions',
+      'Verify medical credentials with affiliated CareOne hospitals',
+      'Join private 2-person VidDoc rooms with consent-gated AI summaries',
+      'Authorize digital prescriptions that auto-build patient courses',
     ],
   },
   {
     id: 'hospital',
     label: 'Hospital',
     icon: Building2,
-    metricLabel: 'Available Beds',
+    headline: 'Doctor verification, ward beds, admissions & dispatch',
     items: [
-      'Track and allocate General, Private, and ICU beds',
-      'Manage OPD, admissions, discharge, and billing',
-      'Verify doctors and dispatch ambulances',
+      'Review and verify affiliated doctors in real time',
+      'Manage General, Private, and ICU beds and admissions',
+      'Coordinate ambulance dispatch & live emergency requests',
     ],
   },
   {
     id: 'pharmacy',
     label: 'Pharmacy',
     icon: Pill,
-    metricLabel: 'Verified Pharmacies',
+    headline: 'Prescription-linked medicine fulfillment & stock alerts',
     items: [
-      'Verify digital prescriptions against orders',
-      'Deduct inventory atomically on approval',
-      'Monitor low stock and 90-day expiry alerts',
+      'Publish verified medicine inventory & pricing',
+      'Verify patient prescription orders in real time',
+      'Coordinate preparation, dispatch, and delivery status',
     ],
   },
 ] as const;
 
 export function LandingPage() {
   const { user } = useAuthStore();
-  const [health, setHealth] = useState<PlatformHealth | null>(null);
   const [activeTabId, setActiveTabId] = useState<(typeof PORTAL_TABS)[number]['id']>('patient');
 
-  useEffect(() => {
-    api
-      .get('/health')
-      .then((res) => setHealth(res.data))
-      .catch(() => {});
-  }, []);
-
-  const portalHref = user ? `/${user.role === 'admin' ? 'hospital' : user.role}` : '/auth';
+  const portalHref = user ? `/${user.role}` : '/auth';
   const activeTab = PORTAL_TABS.find((t) => t.id === activeTabId) || PORTAL_TABS[0];
-
-  const getMetricValue = () => {
-    if (!health) return '—';
-    if (activeTabId === 'patient') return String(health.verified_doctors);
-    if (activeTabId === 'doctor') return String(health.verified_hospitals);
-    if (activeTabId === 'hospital') return String(health.available_beds);
-    return String(health.verified_pharmacies);
-  };
 
   return (
     <div className="min-h-screen bg-[#f5f5f7] text-[#1d1d1f]">
-      {/* 3-Zone Top Bar Contract */}
       <header className="sticky top-0 z-40 h-16 bg-white/75 backdrop-blur-xl border-b border-black/[0.06]">
         <div className="max-w-[1200px] mx-auto px-6 h-full flex items-center justify-between gap-8">
           <Link
@@ -112,7 +90,7 @@ export function LandingPage() {
               Workflows
             </a>
             <Link to="/auth" className="hover:text-[#1d1d1f] transition-colors whitespace-nowrap shrink-0">
-              Demo Access
+              Sign In / Register
             </Link>
           </nav>
 
@@ -128,7 +106,6 @@ export function LandingPage() {
         </div>
       </header>
 
-      {/* Hero + Interactive Glass Console */}
       <section id="portals" className="max-w-[1200px] mx-auto px-6 pt-16 pb-16">
         <div className="max-w-2xl space-y-5">
           <h1
@@ -142,7 +119,7 @@ export function LandingPage() {
           </p>
           <div className="flex flex-wrap items-center gap-3 pt-1">
             <Link to={portalHref} className="mac-btn-primary px-5 py-2.5 text-[14px] inline-flex items-center gap-2">
-              <span>{user ? 'Open Active Portal' : 'Enter CareOne'}</span>
+              <span>{user ? 'Open Active Portal' : 'Get Started'}</span>
               <ArrowRight className="w-4 h-4" />
             </Link>
             <a href="#workflows" className="mac-btn-secondary px-5 py-2.5 text-[14px]">
@@ -151,7 +128,6 @@ export function LandingPage() {
           </div>
         </div>
 
-        {/* Tactile Apple Glass Console Window */}
         <div className="mt-12 glass-card-elevated p-0 overflow-hidden">
           <div className="px-6 py-4 border-b border-black/[0.06] flex flex-wrap items-center justify-between gap-4 bg-white/50">
             <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-black/[0.05]">
@@ -176,16 +152,18 @@ export function LandingPage() {
               })}
             </div>
             <Link to="/auth" className="text-[13px] font-medium text-[#0071e3] hover:underline whitespace-nowrap">
-              Launch {activeTab.label} →
+              Sign in as {activeTab.label} →
             </Link>
           </div>
 
           <div className="p-6 sm:p-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
-            <div className="lg:col-span-5 space-y-5">
+            <div className="lg:col-span-6 space-y-5">
               <div>
-                <p className="text-[13px] font-medium text-[#6e6e73]">{activeTab.metricLabel}</p>
-                <p className="mt-1 text-[52px] leading-none font-semibold font-mono-tabular text-[#1d1d1f]">
-                  {getMetricValue()}
+                <p className="text-[12px] font-semibold uppercase tracking-wider text-[#0071e3]">
+                  {activeTab.label} Portal
+                </p>
+                <p className="mt-1.5 text-[20px] font-semibold text-[#1d1d1f] leading-snug">
+                  {activeTab.headline}
                 </p>
               </div>
               <ul className="divide-y divide-black/[0.06] border-t border-black/[0.06]">
@@ -198,69 +176,63 @@ export function LandingPage() {
               </ul>
             </div>
 
-            <div className="lg:col-span-7 grid grid-cols-2 sm:grid-cols-4 gap-4 lg:border-l lg:border-black/[0.06] lg:pl-8">
-              <div>
-                <p className="text-[12px] text-[#6e6e73]">Doctors</p>
-                <p className="mt-1 text-[28px] font-semibold font-mono-tabular text-[#1d1d1f]">
-                  {health ? health.verified_doctors : '—'}
-                </p>
+            <div className="lg:col-span-6 grid grid-cols-1 sm:grid-cols-2 gap-4 lg:border-l lg:border-black/[0.06] lg:pl-8">
+              <div className="glass-surface-inset p-4 space-y-1.5">
+                <Video className="w-4 h-4 text-[#0071e3]" />
+                <p className="text-[14px] font-semibold text-[#1d1d1f]">2-Person WebRTC VidDoc</p>
+                <p className="text-[12px] text-[#6e6e73]">Private appointment-locked video & audio rooms.</p>
               </div>
-              <div>
-                <p className="text-[12px] text-[#6e6e73]">Hospitals</p>
-                <p className="mt-1 text-[28px] font-semibold font-mono-tabular text-[#1d1d1f]">
-                  {health ? health.verified_hospitals : '—'}
-                </p>
+              <div className="glass-surface-inset p-4 space-y-1.5">
+                <Sparkles className="w-4 h-4 text-[#0071e3]" />
+                <p className="text-[14px] font-semibold text-[#1d1d1f]">Consent-Gated AI</p>
+                <p className="text-[12px] text-[#6e6e73]">Doctor-reviewed consultation summaries & triage.</p>
               </div>
-              <div>
-                <p className="text-[12px] text-[#6e6e73]">Free Beds</p>
-                <p className="mt-1 text-[28px] font-semibold font-mono-tabular text-[#15803d]">
-                  {health ? health.available_beds : '—'}
-                </p>
+              <div className="glass-surface-inset p-4 space-y-1.5">
+                <Pill className="w-4 h-4 text-[#15803d]" />
+                <p className="text-[14px] font-semibold text-[#1d1d1f]">Day-Wise Course</p>
+                <p className="text-[12px] text-[#6e6e73]">Auto-scheduled daily slots from authorized Rx.</p>
               </div>
-              <div>
-                <p className="text-[12px] text-[#6e6e73]">Pharmacies</p>
-                <p className="mt-1 text-[28px] font-semibold font-mono-tabular text-[#0071e3]">
-                  {health ? health.verified_pharmacies : '—'}
-                </p>
+              <div className="glass-surface-inset p-4 space-y-1.5">
+                <ShieldCheck className="w-4 h-4 text-[#15803d]" />
+                <p className="text-[14px] font-semibold text-[#1d1d1f]">Real Cloud Sync</p>
+                <p className="text-[12px] text-[#6e6e73]">Verified multi-device Firebase persistence.</p>
               </div>
             </div>
           </div>
         </div>
       </section>
 
-      {/* Workflows */}
       <section id="workflows" className="max-w-[1200px] mx-auto px-6 pb-20">
         <h2 className="font-display text-[24px] font-semibold text-[#1d1d1f] mb-6">Core Clinical Workflows</h2>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="glass-card space-y-4">
             <div className="flex items-center gap-2.5">
               <Stethoscope className="w-4 h-4 text-[#0071e3]" />
-              <h3 className="text-[17px] font-semibold text-[#1d1d1f]">Outpatient & VidDoc to Pharmacy</h3>
+              <h3 className="text-[17px] font-semibold text-[#1d1d1f]">Outpatient & VidDoc to Medicine Course</h3>
             </div>
             <ol className="divide-y divide-black/[0.06] text-[14px] text-[#1d1d1f]">
-              <li className="py-2.5">1. Book verified specialist slot</li>
-              <li className="py-2.5">2. Attend WebRTC VidDoc session</li>
-              <li className="py-2.5">3. Receive signed digital prescription</li>
-              <li className="py-2.5">4. Order medicines from verified pharmacy</li>
+              <li className="py-2.5">1. Book a hospital-verified specialist</li>
+              <li className="py-2.5">2. Attend live WebRTC VidDoc session</li>
+              <li className="py-2.5">3. Review consented AI summary & signed prescription</li>
+              <li className="py-2.5">4. Follow your auto-generated day-wise medicine schedule</li>
             </ol>
           </div>
 
           <div className="glass-card space-y-4">
             <div className="flex items-center gap-2.5">
               <BedDouble className="w-4 h-4 text-[#15803d]" />
-              <h3 className="text-[17px] font-semibold text-[#1d1d1f]">Emergency to Inpatient Discharge</h3>
+              <h3 className="text-[17px] font-semibold text-[#1d1d1f]">Hospital Verification to Inpatient Care</h3>
             </div>
             <ol className="divide-y divide-black/[0.06] text-[14px] text-[#1d1d1f]">
-              <li className="py-2.5">1. Request ambulance with pickup details</li>
-              <li className="py-2.5">2. Assign ambulance unit and arrival ETA</li>
-              <li className="py-2.5">3. Admit patient and allocate ward bed</li>
-              <li className="py-2.5">4. Release bed, publish summary, and bill</li>
+              <li className="py-2.5">1. Verify affiliated doctors on CareOne</li>
+              <li className="py-2.5">2. Allocate ward & ICU beds dynamically</li>
+              <li className="py-2.5">3. Dispatch ambulances on live emergency requests</li>
+              <li className="py-2.5">4. Coordinate outpatient & inpatient records securely</li>
             </ol>
           </div>
         </div>
       </section>
 
-      {/* Quiet Footer */}
       <footer className="border-t border-black/[0.06] py-8 px-6">
         <div className="max-w-[1200px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-[13px] text-[#6e6e73]">
           <span className="font-medium text-[#1d1d1f]">CareOne</span>

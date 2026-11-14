@@ -34,6 +34,7 @@ export interface HospitalDashboardData {
   patients: any[];
   resources: any[];
   payments: any[];
+  feedbacks: any[];
 }
 
 export function buildActivitySeries(

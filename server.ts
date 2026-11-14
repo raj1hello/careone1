@@ -77,6 +77,7 @@ function attachWebRtcSignaling(server: http.Server) {
 
   wss.on('connection', (ws) => {
     let currentRoom: string | null = null;
+    let currentRole = 'peer';
 
     ws.on('message', (raw) => {
       try {
@@ -85,19 +86,38 @@ function attachWebRtcSignaling(server: http.Server) {
           roomCode?: string;
           payload?: unknown;
           senderRole?: string;
+          senderUid?: string;
         };
 
         if (msg.type === 'join' && msg.roomCode) {
           currentRoom = msg.roomCode;
+          currentRole = msg.senderRole || 'peer';
           if (!rooms.has(currentRoom)) {
             rooms.set(currentRoom, new Set());
           }
           const peers = rooms.get(currentRoom)!;
           peers.add(ws);
 
+          // Notify joining client how many peers are currently in the room
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: 'room-joined',
+                roomCode: currentRoom,
+                peerCount: peers.size,
+              })
+            );
+          }
+
           for (const peer of peers) {
             if (peer !== ws && peer.readyState === WebSocket.OPEN) {
-              peer.send(JSON.stringify({ type: 'peer-joined', senderRole: msg.senderRole || 'peer' }));
+              peer.send(
+                JSON.stringify({
+                  type: 'peer-joined',
+                  senderRole: currentRole,
+                  senderUid: msg.senderUid || '',
+                })
+              );
             }
           }
           return;
@@ -121,7 +141,7 @@ function attachWebRtcSignaling(server: http.Server) {
         peers.delete(ws);
         for (const peer of peers) {
           if (peer.readyState === WebSocket.OPEN) {
-            peer.send(JSON.stringify({ type: 'peer-left' }));
+            peer.send(JSON.stringify({ type: 'peer-left', senderRole: currentRole }));
           }
         }
         if (peers.size === 0) {

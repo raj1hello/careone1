@@ -1,722 +1,983 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
-  Activity,
-  CalendarCheck,
-  FilePlus2,
-  FolderHeart,
+  CalendarCheck2,
+  Check,
+  FileText,
+  Pill,
   Plus,
+  ShieldAlert,
+  ShieldCheck,
+  Star,
   Trash2,
-  UserCog,
+  Upload,
+  UserCheck,
+  Users,
   Video,
+  X,
 } from 'lucide-react';
-import { api, getApiErrorMessage } from '../services/api.ts';
 import { PortalLayout, type NavItem } from '../components/PortalLayout.tsx';
 import { StatusBadge } from '../components/StatusBadge.tsx';
 import { VidDocRoom } from '../components/VidDocRoom.tsx';
+import { useAuthStore } from '../store/authStore.ts';
+import {
+  authorizePrescriptionAndCourse,
+  doctorRespondToAppointment,
+  formatTimestamp,
+  subscribeAppointmentsForUser,
+  subscribeConsultationFeedbacksForDoctor,
+  subscribeConsultationsForUser,
+  subscribeDoctorOwnProfile,
+  subscribeDoctorSharedRecords,
+  subscribePrescriptionsForUser,
+  subscribeVerifiedHospitals,
+  updateDoctorProfile,
+  uploadCareOneFile,
+  type AppointmentDoc,
+  type ConsultationDoc,
+  type ConsultationFeedbackDoc,
+  type DoctorProfileDoc,
+  type HospitalProfileDoc,
+  type MedicalRecordDoc,
+  type PrescriptionDoc,
+} from '../services/careoneDb.ts';
+import {
+  ALL_DOSE_SLOTS,
+  FOOD_INSTRUCTION_OPTIONS,
+  FREQUENCY_PRESETS,
+  type DoseTimeSlot,
+  type PrescribedMedicineItem,
+} from '../utils/medicineSchedule.ts';
 
-const DOCTOR_NAV: NavItem[] = [
-  { id: 'overview', label: 'Overview', icon: Activity },
-  { id: 'appointments', label: 'Appointments', icon: CalendarCheck },
-  { id: 'consultations', label: 'VidDoc & History', icon: Video },
-  { id: 'prescriptions', label: 'Prescriptions', icon: FilePlus2 },
-  { id: 'patients', label: 'Patient Records', icon: FolderHeart },
-  { id: 'profile', label: 'Schedule & Profile', icon: UserCog },
+const NAV_ITEMS: NavItem[] = [
+  { id: 'queue', label: 'Appointments', icon: CalendarCheck2 },
+  { id: 'viddoc', label: 'VidDoc Consults', icon: Video },
+  { id: 'patients', label: 'Authorized Patients', icon: Users },
+  { id: 'prescriptions', label: 'Prescriptions', icon: Pill },
+  { id: 'feedback', label: 'Patient Feedback', icon: Star },
+  { id: 'profile', label: 'Doctor Profile', icon: UserCheck },
 ];
 
+
+const DAYS_OF_WEEK = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+const EMPTY_MED_ITEM = (): PrescribedMedicineItem => ({
+  medicineName: '',
+  dosage: '',
+  frequencyLabel: 'Twice daily (Morning & Evening)',
+  timings: ['Morning', 'Evening'],
+  durationDays: 5,
+  foodInstruction: 'After food',
+  precautions: '',
+});
+
 export function DoctorPortal() {
-  const [activeTab, setActiveTab] = useState('overview');
-  const [loading, setLoading] = useState(true);
-  const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [data, setData] = useState<any>(null);
-  const [consultations, setConsultations] = useState<any[]>([]);
-  const [hospitals, setHospitals] = useState<any[]>([]);
-  const [activeRoom, setActiveRoom] = useState<any | null>(null);
+  const { user, refreshProfile } = useAuthStore();
+  const [activeTab, setActiveTab] = useState('queue');
 
-  const [selectedPatientId, setSelectedPatientId] = useState<number | null>(null);
-  const [patientHistory, setPatientHistory] = useState<any | null>(null);
+  const [docProfile, setDocProfile] = useState<DoctorProfileDoc | null>(null);
+  const [hospitals, setHospitals] = useState<HospitalProfileDoc[]>([]);
+  const [appointments, setAppointments] = useState<AppointmentDoc[]>([]);
+  const [consultations, setConsultations] = useState<ConsultationDoc[]>([]);
+  const [prescriptions, setPrescriptions] = useState<PrescriptionDoc[]>([]);
+  const [sharedRecords, setSharedRecords] = useState<MedicalRecordDoc[]>([]);
 
-  const [rxPatientId, setRxPatientId] = useState<string>('');
-  const [rxConsultId, setRxConsultId] = useState<string>('');
+  const [activeVidDoc, setActiveVidDoc] = useState<ConsultationDoc | null>(null);
+  const [feedback, setFeedback] = useState('');
+  const [errorMsg, setErrorMsg] = useState('');
+
+  // Reschedule modal
+  const [reschedAppt, setReschedAppt] = useState<AppointmentDoc | null>(null);
+  const [reschedDate, setReschedDate] = useState('');
+  const [reschedSlot, setReschedSlot] = useState('11:00');
+  const [reschedNote, setReschedNote] = useState('');
+
+  // Standalone Prescription Builder
+  const [rxPatientUid, setRxPatientUid] = useState('');
   const [rxDiagnosis, setRxDiagnosis] = useState('');
+  const [rxTreatment, setRxTreatment] = useState('');
+  const [rxPrecautions, setRxPrecautions] = useState('');
+  const [rxFollowUp, setRxFollowUp] = useState('');
   const [rxNotes, setRxNotes] = useState('');
-  const [rxItems, setRxItems] = useState([
-    { medicine_name: '', generic_name: '', dosage: '1 tablet', frequency: 'Once daily', duration_days: 14, instructions: 'After food' },
-  ]);
+  const [rxItems, setRxItems] = useState<PrescribedMedicineItem[]>([EMPTY_MED_ITEM()]);
+  const [authorizingRx, setAuthorizingRx] = useState(false);
 
-  const [profileForm, setProfileForm] = useState<Record<string, any>>({});
-
-  const loadAll = async () => {
-    setLoading(true);
-    try {
-      const [dashRes, consRes, hospRes] = await Promise.all([
-        api.get('/doctors/dashboard'),
-        api.get('/consultations'),
-        api.get('/hospitals'),
-      ]);
-      setData(dashRes.data);
-      setConsultations(consRes.data.consultations || []);
-      setHospitals(hospRes.data.hospitals || []);
-
-      const doc = dashRes.data.doctor;
-      if (doc) {
-        let days: string[] = [];
-        try {
-          days = JSON.parse(doc.available_days_json || '[]');
-        } catch {
-          days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
-        }
-        setProfileForm({
-          ...doc,
-          available_days: days,
-          is_available_for_video: Boolean(doc.is_available_for_video),
-        });
-      }
-    } catch (err) {
-      setFeedback({ type: 'err', text: getApiErrorMessage(err) });
-    } finally {
-      setLoading(false);
-    }
-  };
+  // Profile Edit State
+  const [profName, setProfName] = useState('');
+  const [profPhoto, setProfPhoto] = useState('');
+  const [profQual, setProfQual] = useState('');
+  const [profSpec, setProfSpec] = useState('');
+  const [profLicense, setProfLicense] = useState('');
+  const [profExp, setProfExp] = useState(0);
+  const [profFee, setProfFee] = useState(600);
+  const [profHospitalId, setProfHospitalId] = useState('');
+  const [profBio, setProfBio] = useState('');
+  const [profDays, setProfDays] = useState<string[]>([]);
+  const [profStart, setProfStart] = useState('09:00');
+  const [profEnd, setProfEnd] = useState('17:00');
+  const [profOnline, setProfOnline] = useState(true);
+  const [profInPerson, setProfInPerson] = useState(true);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
   useEffect(() => {
-    loadAll();
-  }, []);
+    if (!user?.uid) return;
+    const unsubs = [
+      subscribeDoctorOwnProfile(user.uid, (p) => {
+        setDocProfile(p);
+        if (p) {
+          setProfName(p.fullName || '');
+          setProfPhoto(p.photoUrl || '');
+          setProfQual(p.qualification || '');
+          setProfSpec(p.specialization || '');
+          setProfLicense(p.licenseNo || '');
+          setProfExp(p.experienceYears || 0);
+          setProfFee(p.consultationFee || 0);
+          setProfHospitalId(p.hospitalId || '');
+          setProfBio(p.bio || '');
+          setProfDays(p.availableDays || ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
+          setProfStart(p.slotStartTime || '09:00');
+          setProfEnd(p.slotEndTime || '17:00');
+          setProfOnline(p.availableOnline !== false);
+          setProfInPerson(p.availableInPerson !== false);
+        }
+      }),
+      subscribeVerifiedHospitals(setHospitals),
+      subscribeAppointmentsForUser(user.uid, 'doctor', setAppointments),
+      subscribeConsultationsForUser(user.uid, 'doctor', setConsultations),
+      subscribePrescriptionsForUser(user.uid, 'doctor', setPrescriptions),
+      subscribeDoctorSharedRecords(user.uid, setSharedRecords),
+    ];
+    return () => unsubs.forEach((u) => u());
+  }, [user?.uid]);
 
-  const handleAppointmentStatus = async (id: number, status: 'accepted' | 'rejected' | 'completed') => {
-    setFeedback(null);
-    try {
-      await api.patch(`/appointments/${id}/status`, { status });
-      setFeedback({ type: 'ok', text: `Appointment #${id} ${status}` });
-      await loadAll();
-    } catch (err) {
-      setFeedback({ type: 'err', text: getApiErrorMessage(err) });
+  const authorizedPatients = useMemo(() => {
+    const map = new Map<
+      string,
+      { uid: string; name: string; mrn?: string; allergies?: string; lastVisit: string; visitCount: number }
+    >();
+    for (const a of appointments) {
+      if (['cancelled', 'rejected'].includes(a.status)) continue;
+      const existing = map.get(a.patientUid);
+      if (existing) {
+        existing.visitCount += 1;
+      } else {
+        map.set(a.patientUid, {
+          uid: a.patientUid,
+          name: a.patientName,
+          mrn: a.patientMrn,
+          allergies: a.patientAllergies,
+          lastVisit: `${a.appointmentDate} ${a.timeSlot}`,
+          visitCount: 1,
+        });
+      }
     }
+    return Array.from(map.values());
+  }, [appointments]);
+
+  const consultationsMap = useMemo(() => {
+    const map = new Map<string, ConsultationDoc>();
+    for (const c of consultations) {
+      map.set(c.appointmentId, c);
+    }
+    return map;
+  }, [consultations]);
+
+  const notify = (msg: string) => {
+    setErrorMsg('');
+    setFeedback(msg);
+    setTimeout(() => setFeedback(''), 5000);
   };
 
-  const handleOpenRoom = async (roomCode: string) => {
+  const handleAppointmentAction = async (
+    appt: AppointmentDoc,
+    action: 'accepted' | 'rejected' | 'completed'
+  ) => {
+    if (!user) return;
     try {
-      const res = await api.get(`/consultations/${roomCode}`);
-      setActiveRoom(res.data.consultation);
-    } catch (err) {
-      setFeedback({ type: 'err', text: getApiErrorMessage(err) });
-    }
-  };
-
-  const handleLoadPatientHistory = async (patientId: number) => {
-    setSelectedPatientId(patientId);
-    setPatientHistory(null);
-    try {
-      const res = await api.get(`/doctors/patients/${patientId}/history`);
-      setPatientHistory(res.data);
-      setActiveTab('patients');
-    } catch (err) {
-      setFeedback({ type: 'err', text: getApiErrorMessage(err) });
-    }
-  };
-
-  const handleCreateRx = async (e: FormEvent) => {
-    e.preventDefault();
-    setFeedback(null);
-    try {
-      await api.post('/prescriptions', {
-        patient_id: Number(rxPatientId),
-        consultation_id: rxConsultId ? Number(rxConsultId) : null,
-        diagnosis: rxDiagnosis,
-        notes: rxNotes,
-        items: rxItems,
+      await doctorRespondToAppointment({
+        appointment: appt,
+        doctorUid: user.uid,
+        action,
       });
-      setFeedback({ type: 'ok', text: 'Prescription issued' });
-      setRxDiagnosis('');
-      setRxNotes('');
-      setRxItems([
-        { medicine_name: '', generic_name: '', dosage: '1 tablet', frequency: 'Once daily', duration_days: 14, instructions: 'After food' },
-      ]);
-      await loadAll();
+      notify(`Appointment marked as ${action}.`);
     } catch (err) {
-      setFeedback({ type: 'err', text: getApiErrorMessage(err) });
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to update appointment.');
+    }
+  };
+
+  const handlePhotoUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+    setUploadingPhoto(true);
+    setErrorMsg('');
+    try {
+      const url = await uploadCareOneFile(`doctor_photos/${user.uid}/${Date.now()}_${file.name}`, file);
+      setProfPhoto(url);
+      await updateDoctorProfile(user.uid, { photoUrl: url });
+      notify('Profile photograph uploaded.');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Photo upload failed.');
+    } finally {
+      setUploadingPhoto(false);
     }
   };
 
   const handleSaveProfile = async (e: FormEvent) => {
     e.preventDefault();
-    setFeedback(null);
+    if (!user) return;
+    setErrorMsg('');
     try {
-      await api.put('/doctors/profile', {
-        full_name: profileForm.full_name,
-        phone: profileForm.phone,
-        hospital_id: profileForm.hospital_id ? Number(profileForm.hospital_id) : null,
-        specialization: profileForm.specialization,
-        qualification: profileForm.qualification,
-        experience_years: Number(profileForm.experience_years),
-        consultation_fee: Number(profileForm.consultation_fee),
-        bio: profileForm.bio,
-        available_days: profileForm.available_days,
-        slot_start_time: profileForm.slot_start_time,
-        slot_end_time: profileForm.slot_end_time,
-        is_available_for_video: Boolean(profileForm.is_available_for_video),
+      const selectedHospital = hospitals.find((h) => h.uid === profHospitalId);
+      await updateDoctorProfile(user.uid, {
+        fullName: profName,
+        photoUrl: profPhoto,
+        qualification: profQual,
+        specialization: profSpec,
+        licenseNo: profLicense,
+        experienceYears: Number(profExp) || 0,
+        consultationFee: Number(profFee) || 0,
+        hospitalId: selectedHospital?.uid || '',
+        hospitalName: selectedHospital?.name || 'Independent Practice',
+        bio: profBio,
+        availableDays: profDays,
+        slotStartTime: profStart,
+        slotEndTime: profEnd,
+        availableOnline: profOnline,
+        availableInPerson: profInPerson,
       });
-      setFeedback({ type: 'ok', text: 'Profile updated' });
-      await loadAll();
+      await refreshProfile();
+      notify('Doctor profile updated.');
     } catch (err) {
-      setFeedback({ type: 'err', text: getApiErrorMessage(err) });
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to update doctor profile.');
     }
   };
 
-  const uniquePatients = Array.from(
-    new Map(
-      (data?.appointments || []).map((a: any) => [
-        a.patient_id,
-        { id: a.patient_id, name: a.patient_name, mrn: a.mrn },
-      ])
-    ).values()
-  ) as Array<{ id: number; name: string; mrn: string }>;
+  const updateRxItem = (idx: number, patch: Partial<PrescribedMedicineItem>) => {
+    setRxItems((prev) => prev.map((it, i) => (i === idx ? { ...it, ...patch } : it)));
+  };
+
+  const toggleRxTiming = (idx: number, slot: DoseTimeSlot) => {
+    setRxItems((prev) =>
+      prev.map((it, i) => {
+        if (i !== idx) return it;
+        const next = it.timings.includes(slot)
+          ? it.timings.filter((t) => t !== slot)
+          : [...it.timings, slot];
+        return { ...it, timings: next };
+      })
+    );
+  };
+
+  const handleAuthorizePrescription = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    setErrorMsg('');
+    const pat = authorizedPatients.find((p) => p.uid === rxPatientUid);
+    if (!pat) {
+      setErrorMsg('Select an authorized patient first.');
+      return;
+    }
+    const validItems = rxItems.filter((i) => i.medicineName.trim());
+    if (validItems.length === 0) {
+      setErrorMsg('Add at least one medicine item.');
+      return;
+    }
+
+    setAuthorizingRx(true);
+    try {
+      const res = await authorizePrescriptionAndCourse({
+        patientUid: pat.uid,
+        patientName: pat.name,
+        doctorUid: user.uid,
+        doctorName: docProfile?.fullName || user.fullName,
+        doctorLicenseNo: docProfile?.licenseNo,
+        doctorSpecialization: docProfile?.specialization,
+        diagnosis: rxDiagnosis.trim(),
+        treatmentRecommendations: rxTreatment,
+        specialPrecautions: rxPrecautions,
+        followUpDate: rxFollowUp,
+        additionalInstructions: rxNotes,
+        items: validItems,
+      });
+      setRxDiagnosis('');
+      setRxTreatment('');
+      setRxPrecautions('');
+      setRxFollowUp('');
+      setRxNotes('');
+      setRxItems([EMPTY_MED_ITEM()]);
+      notify(
+        res.scheduleStatus === 'active'
+          ? `Prescription authorized & day-wise medicine schedule activated for ${pat.name}.`
+          : `Prescription authorized. Some incomplete timing/dosage fields were flagged for clarification.`
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to authorize prescription.');
+    } finally {
+      setAuthorizingRx(false);
+    }
+  };
 
   return (
     <PortalLayout
       portalTitle="Doctor Portal"
-      portalSubtitle={data?.doctor ? `${data.doctor.specialization}` : ''}
-      navItems={DOCTOR_NAV}
+      portalSubtitle={docProfile?.specialization || 'Physician Console'}
+      navItems={NAV_ITEMS}
       activeTab={activeTab}
       onTabChange={setActiveTab}
+      theme="glass"
+      headerMeta={
+        docProfile && (
+          <span
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium ${
+              docProfile.verificationStatus === 'verified'
+                ? 'bg-[#ECFDF3] text-[#067647]'
+                : docProfile.verificationStatus === 'rejected'
+                  ? 'bg-red-50 text-[#dc2626]'
+                  : 'bg-[#FEF3C7] text-[#B45309]'
+            }`}
+          >
+            {docProfile.verificationStatus === 'verified' ? (
+              <ShieldCheck className="w-3.5 h-3.5" />
+            ) : (
+              <ShieldAlert className="w-3.5 h-3.5" />
+            )}
+            <span className="capitalize">{docProfile.verificationStatus}</span>
+          </span>
+        )
+      }
     >
-      {feedback && (
-        <div
-          className={`mb-5 px-4 py-3 rounded-xl border text-[13px] font-medium flex items-center justify-between ${
-            feedback.type === 'ok'
-              ? 'border-emerald-200 bg-emerald-50 text-[#15803d]'
-              : 'border-red-200 bg-red-50 text-[#dc2626]'
-          }`}
-        >
-          <span>{feedback.text}</span>
-          <button type="button" onClick={() => setFeedback(null)} className="text-[12px] underline ml-4">
-            Dismiss
+      {activeVidDoc && (
+        <VidDocRoom
+          consultation={activeVidDoc}
+          userRole="doctor"
+          doctorLicenseNo={docProfile?.licenseNo}
+          onClose={() => setActiveVidDoc(null)}
+        />
+      )}
+
+      {docProfile && docProfile.verificationStatus !== 'verified' && (
+        <div className="mb-5 p-4 rounded-2xl bg-amber-50 border border-amber-200 text-[13px] text-[#92400e] flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="font-semibold">
+              Verification Status: {docProfile.verificationStatus.toUpperCase()}
+            </p>
+            <p className="text-[12px] mt-0.5">
+              {docProfile.hospitalId
+                ? `Your profile is awaiting verification by ${docProfile.hospitalName}. Once verified, patients can discover and book your slots.`
+                : 'Select an affiliated hospital in your Doctor Profile so a CareOne hospital administrator can verify your credentials.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActiveTab('profile')}
+            className="mac-btn-secondary px-3.5 py-1.5 text-[12px]"
+          >
+            Review Profile
           </button>
         </div>
       )}
 
-      {loading && !data ? (
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          {[1, 2, 3, 4].map((i) => (
-            <div key={i} className="h-28 glass-card animate-pulse" />
-          ))}
+      {feedback && (
+        <div className="mb-4 px-4 py-3 rounded-xl bg-emerald-50 border border-emerald-200 text-[13px] text-[#067647] flex items-center justify-between">
+          <span>{feedback}</span>
+          <button type="button" onClick={() => setFeedback('')}>
+            <X className="w-4 h-4" />
+          </button>
         </div>
-      ) : (
-        <>
-          {data?.doctor?.verification_status !== 'verified' && (
-            <div className="mb-5 glass-card py-3.5 text-[13px] text-[#6e6e73]">
-              Verification status:{' '}
-              <span className="font-semibold uppercase text-[#0071e3]">{data?.doctor?.verification_status}</span>
+      )}
+
+      {errorMsg && (
+        <div className="mb-4 px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-[13px] text-[#dc2626] flex items-center justify-between">
+          <span>{errorMsg}</span>
+          <button type="button" onClick={() => setErrorMsg('')}>
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* TAB 1: Appointments Queue */}
+      {activeTab === 'queue' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 className="text-[22px] font-semibold text-[#1d1d1f]">Patient Appointment Queue</h1>
+              <p className="text-[13px] text-[#6e6e73]">
+                Accept, reschedule, or start live VidDoc consultations with your patients.
+              </p>
             </div>
-          )}
+            <div className="flex gap-2 text-[12px]">
+              <span className="px-3 py-1.5 rounded-xl bg-white border border-black/[0.07]">
+                Pending: <strong>{appointments.filter((a) => a.status === 'pending').length}</strong>
+              </span>
+              <span className="px-3 py-1.5 rounded-xl bg-white border border-black/[0.07]">
+                Confirmed: <strong>{appointments.filter((a) => a.status === 'accepted').length}</strong>
+              </span>
+            </div>
+          </div>
 
-          {activeTab === 'overview' && data && (
-            <div className="space-y-6">
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                <div className="glass-card">
-                  <p className="text-[12px] font-medium text-[#6e6e73]">Pending Requests</p>
-                  <p className="mt-1.5 text-[34px] leading-none font-semibold font-mono-tabular text-[#0071e3]">
-                    {data.stats.pending_requests}
-                  </p>
-                </div>
-                <div className="glass-card">
-                  <p className="text-[12px] font-medium text-[#6e6e73]">Confirmed Visits</p>
-                  <p className="mt-1.5 text-[34px] leading-none font-semibold font-mono-tabular text-[#15803d]">
-                    {data.stats.todays_confirmed}
-                  </p>
-                </div>
-                <div className="glass-card">
-                  <p className="text-[12px] font-medium text-[#6e6e73]">Completed</p>
-                  <p className="mt-1.5 text-[34px] leading-none font-semibold font-mono-tabular text-[#1d1d1f]">
-                    {data.stats.completed_consultations}
-                  </p>
-                </div>
-                <div className="glass-card">
-                  <p className="text-[12px] font-medium text-[#6e6e73]">Prescriptions</p>
-                  <p className="mt-1.5 text-[34px] leading-none font-semibold font-mono-tabular text-[#1d1d1f]">
-                    {data.stats.total_prescriptions}
-                  </p>
-                </div>
-              </div>
-
-              <div className="glass-card">
-                <h2 className="text-[17px] font-semibold text-[#1d1d1f] mb-3">Appointment Queue</h2>
-                <div className="divide-y divide-black/[0.06]">
-                  {(data.appointments || []).slice(0, 6).map((a: any) => (
-                    <div key={a.id} className="py-3.5 flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <p className="text-[14px] font-semibold text-[#1d1d1f]">
-                          {a.patient_name}{' '}
-                          <span className="text-[12px] font-mono-tabular text-[#6e6e73]">({a.mrn})</span>
-                        </p>
-                        <p className="text-[12px] text-[#6e6e73]">
-                          {a.appointment_date} {a.time_slot} · {a.reason}
-                        </p>
-                      </div>
+          {appointments.length === 0 ? (
+            <div className="glass-card text-center py-12 text-[13px] text-[#6e6e73]">
+              No patient appointment requests yet.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {appointments.map((appt) => {
+                const consult = appt.consultationId ? consultationsMap.get(appt.consultationId) : undefined;
+                return (
+                  <div key={appt.id} className="glass-card flex flex-wrap items-center justify-between gap-4">
+                    <div className="space-y-1 min-w-[240px]">
                       <div className="flex items-center gap-2">
-                        <StatusBadge status={a.status} />
-                        {a.status === 'pending' && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => handleAppointmentStatus(a.id, 'accepted')}
-                              className="mac-btn-primary px-3.5 py-1.5 text-[12px]"
-                            >
-                              Accept
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleAppointmentStatus(a.id, 'rejected')}
-                              className="mac-btn-secondary px-3 py-1.5 text-[12px] text-[#dc2626]"
-                            >
-                              Reject
-                            </button>
-                          </>
-                        )}
-                        {a.status === 'accepted' && a.room_code && (
+                        <h3 className="text-[15px] font-semibold text-[#1d1d1f]">{appt.patientName}</h3>
+                        <StatusBadge status={appt.status} />
+                      </div>
+                      <p className="text-[12px] text-[#6e6e73] font-mono-tabular">
+                        {appt.appointmentDate} · {appt.timeSlot} · {appt.mode === 'video' ? 'Online VidDoc' : 'In-Person'}
+                        {appt.patientMrn ? ` · ${appt.patientMrn}` : ''}
+                      </p>
+                      <p className="text-[13px] text-[#1d1d1f]">Concern: {appt.reason}</p>
+                      {appt.patientAllergies && (
+                        <p className="text-[11px] text-[#b45309]">Allergies: {appt.patientAllergies}</p>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {appt.status === 'pending' && (
+                        <>
                           <button
                             type="button"
-                            onClick={() => handleOpenRoom(a.room_code)}
-                            className="mac-btn-primary inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[12px]"
+                            onClick={() => void handleAppointmentAction(appt, 'accepted')}
+                            className="mac-btn-primary inline-flex items-center gap-1 px-3.5 py-2 text-[12px]"
                           >
-                            <Video className="w-3.5 h-3.5" />
-                            <span>VidDoc</span>
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Accept</span>
                           </button>
-                        )}
-                      </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReschedAppt(appt);
+                              setReschedDate(appt.appointmentDate);
+                              setReschedSlot(appt.timeSlot);
+                              setReschedNote('');
+                            }}
+                            className="mac-btn-secondary px-3 py-2 text-[12px]"
+                          >
+                            Reschedule
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleAppointmentAction(appt, 'rejected')}
+                            className="mac-btn-danger px-3 py-2 text-[12px]"
+                          >
+                            Decline
+                          </button>
+                        </>
+                      )}
+
+                      {['accepted', 'rescheduled'].includes(appt.status) && consult && (
+                        <>
+                          {appt.mode === 'video' && consult.status !== 'ended' && (
+                            <button
+                              type="button"
+                              onClick={() => setActiveVidDoc(consult)}
+                              className="mac-btn-primary inline-flex items-center gap-1.5 px-4 py-2 text-[12px]"
+                            >
+                              <Video className="w-3.5 h-3.5" />
+                              <span>Start VidDoc Room</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => void handleAppointmentAction(appt, 'completed')}
+                            className="mac-btn-secondary px-3 py-2 text-[12px]"
+                          >
+                            Mark Completed
+                          </button>
+                        </>
+                      )}
                     </div>
-                  ))}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: VidDoc Consultations */}
+      {activeTab === 'viddoc' && (
+        <div className="space-y-4">
+          <h1 className="text-[22px] font-semibold text-[#1d1d1f]">VidDoc Consultation Sessions</h1>
+          {consultations.length === 0 ? (
+            <div className="glass-card text-center py-12 text-[13px] text-[#6e6e73]">
+              Accept an appointment to initialize a private VidDoc room.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {consultations.map((c) => (
+                <div key={c.id} className="glass-card space-y-3">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <h3 className="text-[15px] font-semibold text-[#1d1d1f]">{c.patientName}</h3>
+                      <p className="text-[12px] font-mono-tabular text-[#6e6e73]">{c.roomCode}</p>
+                    </div>
+                    <StatusBadge status={c.status} />
+                  </div>
+                  <p className="text-[12px] text-[#1d1d1f]">
+                    Chief Complaint: {c.chiefComplaint || 'Pending assessment'}
+                  </p>
+                  <p className="text-[11px] text-[#6e6e73]">
+                    Patient in room: {c.patientPresent ? 'Yes' : 'No'} · Consent:{' '}
+                    {c.recordingConsent ? 'Granted' : 'Not granted'}
+                  </p>
+                  <div className="flex items-center justify-between pt-2 border-t border-black/[0.06]">
+                    <span className="text-[11px] text-[#6e6e73]">
+                      {c.summaryApprovedByDoctor ? 'AI Summary Approved' : 'Notes Draft'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setActiveVidDoc(c)}
+                      className="mac-btn-primary inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[12px]"
+                    >
+                      <Video className="w-3.5 h-3.5" />
+                      <span>{c.status === 'ended' ? 'View Session' : 'Open Room'}</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
+              ))}
             </div>
           )}
+        </div>
+      )}
 
-          {activeTab === 'appointments' && data && (
-            <div className="glass-card p-0 overflow-hidden">
-              <div className="px-6 py-4 border-b border-black/[0.06]">
-                <h2 className="text-[17px] font-semibold text-[#1d1d1f]">Appointments</h2>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-[13px]">
-                  <thead className="bg-black/[0.025] text-[12px] text-[#6e6e73]">
-                    <tr>
-                      <th className="px-6 py-3 font-medium">Patient</th>
-                      <th className="px-6 py-3 font-medium">Slot</th>
-                      <th className="px-6 py-3 font-medium">Mode</th>
-                      <th className="px-6 py-3 font-medium">Status</th>
-                      <th className="px-6 py-3 font-medium text-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-black/[0.06]">
-                    {data.appointments.map((a: any) => (
-                      <tr key={a.id} className="hover:bg-black/[0.02]">
-                        <td className="px-6 py-3.5">
-                          <p className="font-semibold text-[#1d1d1f]">{a.patient_name}</p>
-                          <p className="text-[12px] text-[#6e6e73] font-mono-tabular">
-                            {a.mrn} · {a.allergies}
-                          </p>
-                        </td>
-                        <td className="px-6 py-3.5 font-mono-tabular text-[#1d1d1f]">
-                          {a.appointment_date} {a.time_slot}
-                        </td>
-                        <td className="px-6 py-3.5">
-                          <StatusBadge status={a.mode} />
-                        </td>
-                        <td className="px-6 py-3.5">
-                          <StatusBadge status={a.status} />
-                        </td>
-                        <td className="px-6 py-3.5 text-right space-x-2 whitespace-nowrap">
-                          <button
-                            type="button"
-                            onClick={() => handleLoadPatientHistory(a.patient_id)}
-                            className="mac-btn-secondary px-3 py-1.5 text-[12px]"
-                          >
-                            History
-                          </button>
-                          {(a.status === 'pending' || a.status === 'rescheduled') && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => handleAppointmentStatus(a.id, 'accepted')}
-                                className="mac-btn-primary px-3.5 py-1.5 text-[12px]"
-                              >
-                                Accept
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleAppointmentStatus(a.id, 'rejected')}
-                                className="mac-btn-secondary px-3 py-1.5 text-[12px] text-[#dc2626]"
-                              >
-                                Reject
-                              </button>
-                            </>
-                          )}
-                          {a.status === 'accepted' && (
-                            <>
-                              {a.room_code && (
-                                <button
-                                  type="button"
-                                  onClick={() => handleOpenRoom(a.room_code)}
-                                  className="mac-btn-primary px-3.5 py-1.5 text-[12px]"
-                                >
-                                  VidDoc
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => handleAppointmentStatus(a.id, 'completed')}
-                                className="mac-btn-secondary px-3 py-1.5 text-[12px] text-[#15803d]"
-                              >
-                                Complete
-                              </button>
-                            </>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'consultations' && (
-            <div className="space-y-4">
-              <h2 className="text-[18px] font-semibold text-[#1d1d1f]">Consultations</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {consultations.map((c) => (
-                  <div key={c.id} className="glass-card space-y-3">
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <p className="text-[15px] font-semibold text-[#1d1d1f]">
-                          {c.patient_name}{' '}
-                          <span className="font-mono-tabular text-[12px] text-[#6e6e73]">({c.mrn})</span>
-                        </p>
-                        <p className="text-[12px] text-[#6e6e73] font-mono-tabular">
-                          {c.room_code} · {c.appointment_date} {c.time_slot}
-                        </p>
-                      </div>
-                      <StatusBadge status={c.status} />
+      {/* TAB 3: Authorized Patient History & Shared Records */}
+      {activeTab === 'patients' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+          <div className="lg:col-span-6 glass-card space-y-3">
+            <h2 className="text-[16px] font-semibold text-[#1d1d1f]">Authorized Patients</h2>
+            <p className="text-[12px] text-[#6e6e73]">
+              Showing only patients who have booked or consulted with you.
+            </p>
+            {authorizedPatients.length === 0 ? (
+              <p className="text-[13px] text-[#6e6e73] py-6 text-center">No patient visits recorded yet.</p>
+            ) : (
+              <div className="divide-y divide-black/[0.06]">
+                {authorizedPatients.map((p) => (
+                  <div key={p.uid} className="py-3 flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-[14px] font-semibold text-[#1d1d1f]">{p.name}</p>
+                      <p className="text-[11px] text-[#6e6e73]">
+                        {p.mrn || 'MRN'} · Last visit: {p.lastVisit} · Visits: {p.visitCount}
+                      </p>
+                      {p.allergies && <p className="text-[11px] text-[#b45309]">Allergies: {p.allergies}</p>}
                     </div>
-                    <p className="text-[13px] text-[#6e6e73]">{c.clinical_notes || 'No notes recorded'}</p>
-                    <div className="flex items-center justify-between pt-3 border-t border-black/[0.06]">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setRxPatientId(String(c.patient_id));
-                          setRxConsultId(String(c.id));
-                          setActiveTab('prescriptions');
-                        }}
-                        className="text-[13px] font-medium text-[#0071e3] hover:underline"
-                      >
-                        Write Prescription
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleOpenRoom(c.room_code)}
-                        className="mac-btn-primary inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[12px]"
-                      >
-                        <Video className="w-3.5 h-3.5" />
-                        <span>Join Room</span>
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRxPatientUid(p.uid);
+                        setActiveTab('prescriptions');
+                      }}
+                      className="mac-btn-secondary px-3 py-1.5 text-[12px]"
+                    >
+                      Prescribe
+                    </button>
                   </div>
                 ))}
               </div>
-            </div>
-          )}
+            )}
+          </div>
 
-          {activeTab === 'prescriptions' && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              <form onSubmit={handleCreateRx} className="lg:col-span-7 glass-card space-y-4">
-                <h2 className="text-[17px] font-semibold text-[#1d1d1f]">New Prescription</h2>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Patient</label>
+          <div className="lg:col-span-6 glass-card space-y-3">
+            <div className="flex items-center gap-2">
+              <FileText className="w-4 h-4 text-[#0071e3]" />
+              <h2 className="text-[16px] font-semibold text-[#1d1d1f]">Patient-Shared Medical Records</h2>
+            </div>
+            {sharedRecords.length === 0 ? (
+              <p className="text-[13px] text-[#6e6e73] py-6 text-center">
+                No medical records have been shared with you yet.
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {sharedRecords.map((rec) => (
+                  <div key={rec.id} className="p-3.5 rounded-xl bg-[#f5f5f7] border border-black/[0.06] space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[13px] font-semibold text-[#1d1d1f]">{rec.title}</span>
+                      <span className="text-[11px] font-mono-tabular text-[#6e6e73]">{rec.recordDate}</span>
+                    </div>
+                    <p className="text-[11px] text-[#6e6e73]">{rec.recordType.replace('_', ' ')}</p>
+                    {rec.summary && <p className="text-[12px] text-[#1d1d1f]">{rec.summary}</p>}
+                    {rec.fileUrl && (
+                      <a
+                        href={rec.fileUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-block text-[12px] font-medium text-[#0071e3] hover:underline pt-1"
+                      >
+                        Open Uploaded Report →
+                      </a>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* TAB 4: Digital Prescriptions */}
+      {activeTab === 'prescriptions' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+          <form onSubmit={handleAuthorizePrescription} className="lg:col-span-7 glass-card space-y-3.5">
+            <h2 className="text-[17px] font-semibold text-[#1d1d1f]">
+              Authorize Digital Prescription &amp; Medicine Course
+            </h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[12px] text-[#6e6e73] mb-1">Authorized Patient *</label>
+                <select
+                  required
+                  value={rxPatientUid}
+                  onChange={(e) => setRxPatientUid(e.target.value)}
+                  className="w-full px-3 py-2 glass-input text-[13px]"
+                >
+                  <option value="">Select patient...</option>
+                  {authorizedPatients.map((p) => (
+                    <option key={p.uid} value={p.uid}>
+                      {p.name} ({p.mrn || 'Patient'})
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[12px] text-[#6e6e73] mb-1">Diagnosis *</label>
+                <input
+                  required
+                  value={rxDiagnosis}
+                  onChange={(e) => setRxDiagnosis(e.target.value)}
+                  placeholder="Clinical diagnosis"
+                  className="w-full px-3 py-2 glass-input text-[13px]"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2.5">
+              {rxItems.map((item, idx) => (
+                <div key={idx} className="p-3 rounded-xl bg-[#f5f5f7] border border-black/[0.06] space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-semibold">Medicine #{idx + 1}</span>
+                    {rxItems.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setRxItems((prev) => prev.filter((_, i) => i !== idx))}
+                        className="text-[#dc2626] text-[11px] inline-flex items-center gap-1"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Remove</span>
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <input
+                      value={item.medicineName}
+                      onChange={(e) => updateRxItem(idx, { medicineName: e.target.value })}
+                      placeholder="Medicine name *"
+                      className="px-2.5 py-1.5 glass-input text-[12px]"
+                    />
+                    <input
+                      value={item.dosage}
+                      onChange={(e) => updateRxItem(idx, { dosage: e.target.value })}
+                      placeholder="Dosage (e.g. 500mg)"
+                      className="px-2.5 py-1.5 glass-input text-[12px]"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={item.durationDays}
+                      onChange={(e) => updateRxItem(idx, { durationDays: Number(e.target.value) })}
+                      placeholder="Days"
+                      className="px-2.5 py-1.5 glass-input text-[12px]"
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     <select
-                      required
-                      value={rxPatientId}
-                      onChange={(e) => setRxPatientId(e.target.value)}
-                      className="w-full px-3 py-2 glass-input text-[13px]"
+                      value={item.frequencyLabel}
+                      onChange={(e) => {
+                        const preset = FREQUENCY_PRESETS.find((p) => p.label === e.target.value);
+                        updateRxItem(idx, {
+                          frequencyLabel: e.target.value,
+                          timings: preset ? preset.timings : item.timings,
+                        });
+                      }}
+                      className="px-2.5 py-1.5 glass-input text-[12px]"
                     >
-                      <option value="">Select patient...</option>
-                      {uniquePatients.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} ({p.mrn})
+                      {FREQUENCY_PRESETS.map((p) => (
+                        <option key={p.label} value={p.label}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={item.foodInstruction}
+                      onChange={(e) => updateRxItem(idx, { foodInstruction: e.target.value })}
+                      className="px-2.5 py-1.5 glass-input text-[12px]"
+                    >
+                      {FOOD_INSTRUCTION_OPTIONS.map((f) => (
+                        <option key={f} value={f}>
+                          {f}
                         </option>
                       ))}
                     </select>
                   </div>
-                  <div>
-                    <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Diagnosis</label>
-                    <input
-                      required
-                      value={rxDiagnosis}
-                      onChange={(e) => setRxDiagnosis(e.target.value)}
-                      placeholder="Diagnosis"
-                      className="w-full px-3 py-2 glass-input text-[13px]"
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[13px] font-medium text-[#1d1d1f]">Medications</span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setRxItems((prev) => [
-                          ...prev,
-                          { medicine_name: '', generic_name: '', dosage: '1 tablet', frequency: 'Twice daily', duration_days: 7, instructions: 'After meals' },
-                        ])
-                      }
-                      className="inline-flex items-center gap-1 text-[12px] font-medium text-[#0071e3] hover:underline"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Add Item</span>
-                    </button>
-                  </div>
-
-                  {rxItems.map((item, idx) => (
-                    <div key={idx} className="grid grid-cols-12 gap-2 items-center">
-                      <input
-                        required
-                        placeholder="Medicine"
-                        value={item.medicine_name}
-                        onChange={(e) => {
-                          const next = [...rxItems];
-                          next[idx].medicine_name = e.target.value;
-                          setRxItems(next);
-                        }}
-                        className="col-span-5 px-2.5 py-2 glass-input text-[12px]"
-                      />
-                      <input
-                        required
-                        placeholder="Dosage"
-                        value={item.dosage}
-                        onChange={(e) => {
-                          const next = [...rxItems];
-                          next[idx].dosage = e.target.value;
-                          setRxItems(next);
-                        }}
-                        className="col-span-3 px-2.5 py-2 glass-input text-[12px]"
-                      />
-                      <input
-                        required
-                        placeholder="Frequency"
-                        value={item.frequency}
-                        onChange={(e) => {
-                          const next = [...rxItems];
-                          next[idx].frequency = e.target.value;
-                          setRxItems(next);
-                        }}
-                        className="col-span-2 px-2.5 py-2 glass-input text-[12px]"
-                      />
-                      <input
-                        type="number"
-                        min={1}
-                        value={item.duration_days}
-                        onChange={(e) => {
-                          const next = [...rxItems];
-                          next[idx].duration_days = Number(e.target.value);
-                          setRxItems(next);
-                        }}
-                        className="col-span-1 px-1.5 py-2 glass-input text-[12px] font-mono-tabular"
-                      />
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {ALL_DOSE_SLOTS.map((slot) => (
                       <button
+                        key={slot}
                         type="button"
-                        disabled={rxItems.length === 1}
-                        onClick={() => setRxItems((prev) => prev.filter((_, i) => i !== idx))}
-                        className="col-span-1 text-[#dc2626] disabled:opacity-30 flex justify-center"
+                        onClick={() => toggleRxTiming(idx, slot)}
+                        className={`px-2 py-0.5 rounded-md text-[11px] font-medium ${
+                          item.timings.includes(slot)
+                            ? 'bg-[#0071e3] text-white'
+                            : 'bg-white border border-black/[0.08] text-[#6e6e73]'
+                        }`}
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        {slot}
                       </button>
-                    </div>
-                  ))}
-                </div>
-
-                <textarea
-                  rows={2}
-                  value={rxNotes}
-                  onChange={(e) => setRxNotes(e.target.value)}
-                  placeholder="Instructions..."
-                  className="w-full px-3 py-2 glass-input text-[13px]"
-                />
-
-                <button type="submit" className="mac-btn-primary px-5 py-2.5 text-[13px]">
-                  Issue Prescription
-                </button>
-              </form>
-
-              <div className="lg:col-span-5 glass-card space-y-3">
-                <h3 className="text-[17px] font-semibold text-[#1d1d1f]">Recent Prescriptions</h3>
-                <div className="divide-y divide-black/[0.06]">
-                  {(data?.prescriptions || []).map((rx: any) => (
-                    <div key={rx.id} className="py-3 space-y-1">
-                      <div className="flex items-center justify-between">
-                        <p className="text-[13px] font-semibold text-[#1d1d1f]">
-                          Rx #{rx.id} · {rx.patient_name}
-                        </p>
-                        <StatusBadge status={rx.status} />
-                      </div>
-                      <p className="text-[12px] font-medium text-[#0071e3]">{rx.diagnosis}</p>
-                      <p className="text-[12px] text-[#6e6e73]">
-                        {(rx.items || []).map((i: any) => `${i.medicine_name} (${i.dosage})`).join(', ')}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'patients' && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              <div className="lg:col-span-4 glass-card space-y-3">
-                <h2 className="text-[17px] font-semibold text-[#1d1d1f]">Patients</h2>
-                <div className="divide-y divide-black/[0.06]">
-                  {uniquePatients.map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => handleLoadPatientHistory(p.id)}
-                      className={`w-full text-left py-3 px-2.5 rounded-lg transition-colors ${
-                        selectedPatientId === p.id ? 'bg-[#0071e3]/10' : 'hover:bg-black/[0.03]'
-                      }`}
-                    >
-                      <p className="text-[14px] font-semibold text-[#1d1d1f]">{p.name}</p>
-                      <p className="text-[12px] font-mono-tabular text-[#6e6e73]">{p.mrn}</p>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="lg:col-span-8 glass-card">
-                {!patientHistory ? (
-                  <p className="text-[14px] text-[#6e6e73]">Select a patient</p>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="border-b border-black/[0.06] pb-3.5">
-                      <h3 className="text-[20px] font-semibold text-[#1d1d1f]">{patientHistory.patient.full_name}</h3>
-                      <p className="text-[12px] font-mono-tabular text-[#6e6e73] mt-1">
-                        {patientHistory.patient.mrn} · {patientHistory.patient.blood_group || 'N/A'} · Allergies:{' '}
-                        {patientHistory.patient.allergies}
-                      </p>
-                    </div>
-                    <div>
-                      <h4 className="text-[14px] font-semibold text-[#1d1d1f] mb-2">Records</h4>
-                      <div className="divide-y divide-black/[0.06]">
-                        {patientHistory.records.map((r: any) => (
-                          <div key={r.id} className="py-3 text-[13px]">
-                            <p className="font-semibold text-[#1d1d1f]">
-                              {r.title} <span className="font-mono-tabular text-[#6e6e73]">({r.record_date})</span>
-                            </p>
-                            <p className="text-[#6e6e73] mt-0.5">{r.summary}</p>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {activeTab === 'profile' && (
-            <form onSubmit={handleSaveProfile} className="glass-card space-y-5">
-              <h2 className="text-[17px] font-semibold text-[#1d1d1f]">Profile & Schedule</h2>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Full Name</label>
-                  <input
-                    value={profileForm.full_name || ''}
-                    onChange={(e) => setProfileForm({ ...profileForm, full_name: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Specialization</label>
-                  <input
-                    value={profileForm.specialization || ''}
-                    onChange={(e) => setProfileForm({ ...profileForm, specialization: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Hospital</label>
-                  <select
-                    value={profileForm.hospital_id || ''}
-                    onChange={(e) => setProfileForm({ ...profileForm, hospital_id: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px]"
-                  >
-                    <option value="">Independent</option>
-                    {hospitals.map((h) => (
-                      <option key={h.id} value={h.id}>
-                        {h.name}
-                      </option>
                     ))}
-                  </select>
+                  </div>
                 </div>
-                <div>
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Fee (INR)</label>
-                  <input
-                    type="number"
-                    value={profileForm.consultation_fee || 0}
-                    onChange={(e) => setProfileForm({ ...profileForm, consultation_fee: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px] font-mono-tabular"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Start Time</label>
-                  <input
-                    type="time"
-                    value={profileForm.slot_start_time || '09:00'}
-                    onChange={(e) => setProfileForm({ ...profileForm, slot_start_time: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px] font-mono-tabular"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">End Time</label>
-                  <input
-                    type="time"
-                    value={profileForm.slot_end_time || '17:00'}
-                    onChange={(e) => setProfileForm({ ...profileForm, slot_end_time: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px] font-mono-tabular"
-                  />
-                </div>
-                <div className="md:col-span-3">
-                  <label className="block text-[12px] font-medium text-[#6e6e73] mb-1">Bio</label>
-                  <textarea
-                    rows={3}
-                    value={profileForm.bio || ''}
-                    onChange={(e) => setProfileForm({ ...profileForm, bio: e.target.value })}
-                    className="w-full px-3.5 py-2 glass-input text-[14px]"
-                  />
-                </div>
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setRxItems((prev) => [...prev, EMPTY_MED_ITEM()])}
+              className="mac-btn-secondary inline-flex items-center gap-1.5 px-3 py-1.5 text-[12px]"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Medicine</span>
+            </button>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <input
+                value={rxTreatment}
+                onChange={(e) => setRxTreatment(e.target.value)}
+                placeholder="Treatment recommendations"
+                className="px-3 py-2 glass-input text-[12px]"
+              />
+              <input
+                value={rxPrecautions}
+                onChange={(e) => setRxPrecautions(e.target.value)}
+                placeholder="Special precautions"
+                className="px-3 py-2 glass-input text-[12px]"
+              />
+              <input
+                type="date"
+                value={rxFollowUp}
+                onChange={(e) => setRxFollowUp(e.target.value)}
+                className="px-3 py-2 glass-input text-[12px]"
+              />
+              <input
+                value={rxNotes}
+                onChange={(e) => setRxNotes(e.target.value)}
+                placeholder="Additional instructions"
+                className="px-3 py-2 glass-input text-[12px]"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={authorizingRx}
+              className="mac-btn-primary w-full py-2.5 text-[13px] disabled:opacity-50"
+            >
+              {authorizingRx ? 'Authorizing Prescription...' : 'Authorize Prescription & Generate Day-Wise Course'}
+            </button>
+          </form>
+
+          <div className="lg:col-span-5 glass-card space-y-3">
+            <h2 className="text-[16px] font-semibold text-[#1d1d1f]">Authorized Prescriptions Issued</h2>
+            {prescriptions.length === 0 ? (
+              <p className="text-[13px] text-[#6e6e73] py-6 text-center">No prescriptions issued yet.</p>
+            ) : (
+              <div className="space-y-2.5">
+                {prescriptions.map((rx) => (
+                  <div key={rx.id} className="p-3.5 rounded-xl bg-[#f5f5f7] border border-black/[0.06] space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[13px] font-semibold text-[#1d1d1f]">{rx.patientName}</span>
+                      <StatusBadge status={rx.status} />
+                    </div>
+                    <p className="text-[12px] text-[#0071e3] font-medium">{rx.diagnosis}</p>
+                    <p className="text-[11px] text-[#6e6e73]">
+                      {rx.items.length} medicine(s) · {formatTimestamp(rx.createdAt)}
+                    </p>
+                  </div>
+                ))}
               </div>
-              <label className="flex items-center gap-2 text-[13px] text-[#1d1d1f]">
-                <input
-                  type="checkbox"
-                  checked={Boolean(profileForm.is_available_for_video)}
-                  onChange={(e) => setProfileForm({ ...profileForm, is_available_for_video: e.target.checked })}
-                  className="accent-[#0071e3]"
-                />
-                <span>Available for VidDoc</span>
-              </label>
-              <button type="submit" className="mac-btn-primary px-5 py-2.5 text-[13px]">
-                Save Profile
-              </button>
-            </form>
-          )}
-        </>
+            )}
+          </div>
+        </div>
       )}
 
-      {activeRoom && (
-        <VidDocRoom
-          consultation={activeRoom}
-          userRole="doctor"
-          onClose={() => setActiveRoom(null)}
-          onSaved={loadAll}
-        />
+      {/* TAB 5: Doctor Profile & Verification Settings */}
+      {activeTab === 'profile' && (
+        <form onSubmit={handleSaveProfile} className="glass-card max-w-3xl space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-black/[0.06]">
+            <div className="flex items-center gap-3">
+              {profPhoto ? (
+                <img src={profPhoto} alt={profName} className="w-14 h-14 rounded-2xl object-cover border border-black/[0.08]" />
+              ) : (
+                <div className="w-14 h-14 rounded-2xl bg-[#0071e3]/10 text-[#0071e3] font-semibold flex items-center justify-center">
+                  {profName.slice(0, 2).toUpperCase() || 'DR'}
+                </div>
+              )}
+              <div>
+                <h2 className="text-[18px] font-semibold text-[#1d1d1f]">{profName || user?.fullName}</h2>
+                <p className="text-[12px] text-[#6e6e73]">
+                  Status: <strong className="capitalize">{docProfile?.verificationStatus || 'pending'}</strong>
+                </p>
+              </div>
+            </div>
+
+            <label className="mac-btn-secondary px-3.5 py-2 text-[12px] inline-flex items-center gap-1.5 cursor-pointer">
+              <Upload className="w-3.5 h-3.5 text-[#0071e3]" />
+              <span>{uploadingPhoto ? 'Uploading...' : 'Upload Profile Photo'}</span>
+              <input type="file" accept="image/*" className="hidden" onChange={handlePhotoUpload} />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Full Name</label>
+              <input required value={profName} onChange={(e) => setProfName(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+            </div>
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Medical Qualification</label>
+              <input required value={profQual} onChange={(e) => setProfQual(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+            </div>
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Specialization</label>
+              <input required value={profSpec} onChange={(e) => setProfSpec(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+            </div>
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Medical Registration No.</label>
+              <input required value={profLicense} onChange={(e) => setProfLicense(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+            </div>
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Experience (Years)</label>
+              <input type="number" min={0} max={80} value={profExp} onChange={(e) => setProfExp(Number(e.target.value))} className="w-full px-3 py-2 glass-input text-[13px]" />
+            </div>
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Consultation Fee (INR)</label>
+              <input type="number" min={0} value={profFee} onChange={(e) => setProfFee(Number(e.target.value))} className="w-full px-3 py-2 glass-input text-[13px]" />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Affiliated Hospital</label>
+              <select
+                value={profHospitalId}
+                onChange={(e) => setProfHospitalId(e.target.value)}
+                className="w-full px-3 py-2 glass-input text-[13px]"
+              >
+                <option value="">Independent Practice</option>
+                {hospitals.map((h) => (
+                  <option key={h.uid} value={h.uid}>
+                    {h.name} ({h.city || 'CareOne'})
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+            <div>
+              <label className="block text-[12px] text-[#6e6e73] mb-1">Available Days</label>
+              <div className="flex flex-wrap gap-1.5">
+                {DAYS_OF_WEEK.map((d) => (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() =>
+                      setProfDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d]))
+                    }
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-medium ${
+                      profDays.includes(d) ? 'bg-[#0071e3] text-white' : 'mac-btn-secondary'
+                    }`}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-[12px] text-[#6e6e73] mb-1">Start Time</label>
+                <input type="time" value={profStart} onChange={(e) => setProfStart(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+              </div>
+              <div>
+                <label className="block text-[12px] text-[#6e6e73] mb-1">End Time</label>
+                <input type="time" value={profEnd} onChange={(e) => setProfEnd(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-4 text-[13px]">
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={profOnline} onChange={(e) => setProfOnline(e.target.checked)} />
+              <span>Available for Online VidDoc</span>
+            </label>
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={profInPerson} onChange={(e) => setProfInPerson(e.target.checked)} />
+              <span>Available for In-Person Clinic</span>
+            </label>
+          </div>
+
+          <div>
+            <label className="block text-[12px] text-[#6e6e73] mb-1">Professional Description</label>
+            <textarea rows={3} value={profBio} onChange={(e) => setProfBio(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+          </div>
+
+          <button type="submit" className="mac-btn-primary px-5 py-2.5 text-[13px]">
+            Save Doctor Profile
+          </button>
+        </form>
+      )}
+
+      {/* Reschedule Modal */}
+      {reschedAppt && (
+        <div className="fixed inset-0 z-50 bg-black/35 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="glass-card-elevated max-w-sm w-full space-y-3.5">
+            <h3 className="text-[16px] font-semibold">Reschedule {reschedAppt.patientName}</h3>
+            <input type="date" value={reschedDate} onChange={(e) => setReschedDate(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+            <input type="time" value={reschedSlot} onChange={(e) => setReschedSlot(e.target.value)} className="w-full px-3 py-2 glass-input text-[13px]" />
+            <input
+              value={reschedNote}
+              onChange={(e) => setReschedNote(e.target.value)}
+              placeholder="Note to patient (optional)"
+              className="w-full px-3 py-2 glass-input text-[13px]"
+            />
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setReschedAppt(null)} className="mac-btn-secondary px-4 py-2 text-[12px]">
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!user) return;
+                  await doctorRespondToAppointment({
+                    appointment: reschedAppt,
+                    doctorUid: user.uid,
+                    action: 'rescheduled',
+                    appointmentDate: reschedDate,
+                    timeSlot: reschedSlot,
+                    doctorNotes: reschedNote,
+                  });
+                  setReschedAppt(null);
+                  notify('Appointment rescheduled.');
+                }}
+                className="mac-btn-primary px-4 py-2 text-[12px]"
+              >
+                Confirm Reschedule
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </PortalLayout>
   );

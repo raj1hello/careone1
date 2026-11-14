@@ -15,23 +15,22 @@ function ProtectedPortalRoute({
   allowedRoles: UserRole[];
   children: ReactNode;
 }) {
-  const { user, isInitialized } = useAuthStore();
+  const { user, needsOnboarding, emailVerificationRequired, isInitialized } = useAuthStore();
 
   if (!isInitialized) {
     return (
       <div className="min-h-screen bg-[#f5f5f7] flex items-center justify-center text-[14px] font-medium text-[#6e6e73]">
-        Loading...
+        Connecting to CareOne...
       </div>
     );
   }
 
-  if (!user) {
+  if (!user || needsOnboarding || emailVerificationRequired) {
     return <Navigate to="/auth" replace />;
   }
 
   if (!allowedRoles.includes(user.role)) {
-    const fallback = user.role === 'admin' ? '/hospital' : `/${user.role}`;
-    return <Navigate to={fallback} replace />;
+    return <Navigate to={`/${user.role}`} replace />;
   }
 
   return <>{children}</>;
@@ -41,7 +40,10 @@ export default function App() {
   const { initAuth } = useAuthStore();
 
   useEffect(() => {
-    initAuth();
+    const unsub = initAuth();
+    return () => {
+      if (typeof unsub === 'function') unsub();
+    };
   }, [initAuth]);
 
   return (
@@ -68,7 +70,7 @@ export default function App() {
         <Route
           path="/hospital/*"
           element={
-            <ProtectedPortalRoute allowedRoles={['hospital', 'admin']}>
+            <ProtectedPortalRoute allowedRoles={['hospital']}>
               <HospitalPortal />
             </ProtectedPortalRoute>
           }

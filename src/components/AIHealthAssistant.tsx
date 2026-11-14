@@ -15,8 +15,12 @@ import {
   Stethoscope,
   Video,
 } from 'lucide-react';
-import axios from 'axios';
-import { api, getApiErrorMessage } from '../services/api.ts';
+import { useAuthStore } from '../store/authStore.ts';
+import type {
+  DoctorProfileDoc,
+  MedicalRecordDoc,
+  PatientProfileDoc,
+} from '../services/careoneDb.ts';
 
 export interface AISummary {
   concern_overview?: string;
@@ -33,9 +37,10 @@ export interface ChatTurn {
   id: string;
   role: 'user' | 'assistant' | 'integration_notice';
   content: string;
+  streaming?: boolean;
   stage?: 'intake' | 'summary' | 'emergency';
   summary?: AISummary | null;
-  endpoint?: string;
+  recommended_doctors?: DoctorProfileDoc[];
 }
 
 export interface NavigateOptions {
@@ -46,7 +51,11 @@ export interface NavigateOptions {
 
 interface AIHealthAssistantProps {
   patientName: string;
+  patientProfile?: PatientProfileDoc | null;
+  verifiedDoctors: DoctorProfileDoc[];
+  medicalRecords: MedicalRecordDoc[];
   onNavigate: (tab: string, options?: NavigateOptions) => void;
+  onBookDoctor?: (doc: DoctorProfileDoc, summary?: AISummary | null) => void;
 }
 
 const STARTER_PROMPTS = [
@@ -78,7 +87,41 @@ function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
   return w.SpeechRecognition || w.webkitSpeechRecognition || null;
 }
 
-export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistantProps) {
+function matchDoctorsBySpecialist(
+  doctors: DoctorProfileDoc[],
+  suggestedSpecialist?: string
+): DoctorProfileDoc[] {
+  const verified = doctors.filter((d) => d.verificationStatus === 'verified');
+  const norm = (suggestedSpecialist || '').trim().toLowerCase();
+  if (!norm) return verified.slice(0, 4);
+
+  const matched = verified.filter((d) => {
+    const docSpec = (d.specialization || '').toLowerCase();
+    return (
+      docSpec.includes(norm) ||
+      norm.includes(docSpec) ||
+      (norm.includes('general') && (docSpec.includes('internal') || docSpec.includes('general'))) ||
+      (norm.includes('physician') && (docSpec.includes('internal') || docSpec.includes('general'))) ||
+      (norm.includes('cardio') && docSpec.includes('cardio')) ||
+      (norm.includes('neuro') && docSpec.includes('neuro')) ||
+      (norm.includes('pulmo') && docSpec.includes('pulmo')) ||
+      (norm.includes('derm') && docSpec.includes('derm')) ||
+      (norm.includes('ortho') && docSpec.includes('ortho'))
+    );
+  });
+
+  return (matched.length > 0 ? matched : verified).slice(0, 4);
+}
+
+export function AIHealthAssistant({
+  patientName,
+  patientProfile,
+  verifiedDoctors,
+  medicalRecords,
+  onNavigate,
+  onBookDoctor,
+}: AIHealthAssistantProps) {
+  const { getIdToken } = useAuthStore();
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -92,21 +135,26 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
 
   useEffect(() => {
     let active = true;
-    api
-      .get('/ai/status')
-      .then((res) => {
-        if (active) {
-          setGeminiConfigured(Boolean(res.data?.configured));
+    (async () => {
+      try {
+        const token = await getIdToken();
+        if (!token) return;
+        const res = await fetch('/api/ai/status', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json().catch(() => ({}));
+        if (active && res.ok) {
+          setGeminiConfigured(Boolean(data.configured));
         }
-      })
-      .catch(() => {
+      } catch {
         if (active) setGeminiConfigured(null);
-      });
+      }
+    })();
     return () => {
       active = false;
       recognitionRef.current?.stop();
     };
-  }, []);
+  }, [getIdToken]);
 
   useEffect(() => {
     threadEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -160,6 +208,22 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
     }
   };
 
+  const buildPatientContextPayload = () => ({
+    fullName: patientProfile?.fullName || patientName,
+    bloodGroup: patientProfile?.bloodGroup || '',
+    allergies: patientProfile?.allergies || '',
+    chronicConditions: patientProfile?.chronicConditions || '',
+    specializations: Array.from(
+      new Set(verifiedDoctors.map((d) => d.specialization).filter(Boolean))
+    ).slice(0, 30),
+    recentRecords: medicalRecords.slice(0, 5).map((r) => ({
+      title: r.title,
+      recordType: r.recordType,
+      recordDate: r.recordDate,
+      summary: r.summary || '',
+    })),
+  });
+
   const sendMessage = async (textOverride?: string) => {
     const trimmed = (textOverride ?? input).trim();
     if (!trimmed || sending) return;
@@ -175,8 +239,16 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
       content: trimmed,
     };
 
+    const assistantId = `a-${Date.now() + 1}`;
+    const placeholderAssistant: ChatTurn = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      streaming: true,
+    };
+
     const nextHistory = [...messages, userTurn];
-    setMessages(nextHistory);
+    setMessages([...nextHistory, placeholderAssistant]);
     if (!textOverride) setInput('');
     setVoiceFeedback(null);
     setSending(true);
@@ -185,42 +257,173 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
+    const patientContext = buildPatientContextPayload();
+
+    const removePlaceholder = () => {
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+    };
+
     try {
-      const res = await api.post('/ai/assistant', { messages: payloadMessages });
-      setGeminiConfigured(true);
-      const assistantTurn: ChatTurn = {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: res.data.reply,
-        stage: res.data.stage || 'intake',
-        summary: res.data.summary || null,
-      };
-      setMessages((prev) => [...prev, assistantTurn]);
-    } catch (err) {
-      if (axios.isAxiosError(err) && err.response?.status === 503 && err.response?.data?.configured === false) {
-        setGeminiConfigured(false);
+      const token = await getIdToken();
+      if (!token) {
+        removePlaceholder();
         setMessages((prev) => [
           ...prev,
           {
             id: `n-${Date.now()}`,
             role: 'integration_notice',
-            content:
-              err.response?.data?.error ||
-              'Gemini backend credentials are not configured on the server yet.',
-            endpoint: err.response?.data?.endpoint || '/api/ai/assistant',
+            content: 'Please sign in again to access CareOne AI Health Assistant.',
           },
         ]);
-      } else {
+        return;
+      }
+
+      const response = await fetch('/api/ai/assistant/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ messages: payloadMessages, patientContext }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        removePlaceholder();
+        if (response.status === 503 && errData?.configured === false) {
+          setGeminiConfigured(false);
+        }
         setMessages((prev) => [
           ...prev,
           {
-            id: `e-${Date.now()}`,
+            id: `n-${Date.now()}`,
             role: 'integration_notice',
-            content: getApiErrorMessage(err, 'Unable to reach the CareOne Gemini assistant endpoint.'),
-            endpoint: '/api/ai/assistant',
+            content: errData?.error || 'Unable to reach CareOne AI assistant.',
           },
         ]);
+        return;
       }
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('text/event-stream') || !response.body) {
+        const jsonRes = await fetch('/api/ai/assistant', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ messages: payloadMessages, patientContext }),
+        });
+        const data = await jsonRes.json().catch(() => ({}));
+        if (!jsonRes.ok) {
+          removePlaceholder();
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `e-${Date.now()}`,
+              role: 'integration_notice',
+              content: data?.error || 'Unable to reach CareOne AI assistant.',
+            },
+          ]);
+          return;
+        }
+        setGeminiConfigured(true);
+        const docs =
+          data.stage === 'summary' || data.stage === 'emergency' || data.summary?.suggested_specialist
+            ? matchDoctorsBySpecialist(verifiedDoctors, data.summary?.suggested_specialist)
+            : [];
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: data.reply,
+                  streaming: false,
+                  stage: data.stage || 'intake',
+                  summary: data.summary || null,
+                  recommended_doctors: docs,
+                }
+              : m
+          )
+        );
+        return;
+      }
+
+      setGeminiConfigured(true);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let streamDone = false;
+
+      while (!streamDone) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data:')) continue;
+          const jsonText = line.slice(5).trim();
+          if (!jsonText) continue;
+
+          try {
+            const evt = JSON.parse(jsonText);
+            if (evt.type === 'delta' && typeof evt.text === 'string') {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId ? { ...m, content: m.content + evt.text } : m
+                )
+              );
+            } else if (evt.type === 'final') {
+              streamDone = true;
+              const docs =
+                evt.stage === 'summary' || evt.stage === 'emergency' || evt.summary?.suggested_specialist
+                  ? matchDoctorsBySpecialist(verifiedDoctors, evt.summary?.suggested_specialist)
+                  : [];
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? {
+                        ...m,
+                        content: evt.reply || m.content,
+                        streaming: false,
+                        stage: evt.stage || 'intake',
+                        summary: evt.summary || null,
+                        recommended_doctors: docs,
+                      }
+                    : m
+                )
+              );
+            } else if (evt.type === 'error') {
+              streamDone = true;
+              removePlaceholder();
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: `e-${Date.now()}`,
+                  role: 'integration_notice',
+                  content: evt.error || 'Unable to reach the CareOne Gemini assistant.',
+                },
+              ]);
+            }
+          } catch {
+            // Ignore partial SSE JSON chunk
+          }
+        }
+      }
+    } catch (err) {
+      removePlaceholder();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `e-${Date.now()}`,
+          role: 'integration_notice',
+          content: err instanceof Error ? err.message : 'Unable to reach the CareOne assistant.',
+        },
+      ]);
     } finally {
       setSending(false);
     }
@@ -250,23 +453,20 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
   const hasConversation = messages.length > 0;
 
   return (
-    <div className="max-w-4xl mx-auto flex flex-col gap-6">
-      {/* Top CareOne AI Branding Strip */}
+    <div className="max-w-4xl mx-auto flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="inline-flex items-center gap-2.5 px-3.5 py-1.5 rounded-full bg-[#232269] border border-[#00b1ff]/30">
-          <span className="w-5 h-5 rounded-md bg-[#5350cc] flex items-center justify-center">
-            <Activity className="w-3.5 h-3.5 text-[#00ffaa]" />
+        <div className="inline-flex items-center gap-2.5 px-3.5 py-1.5 rounded-xl bg-white border border-black/[0.07] shadow-2xs">
+          <span className="w-5 h-5 rounded-md bg-[#1d1d1f] flex items-center justify-center">
+            <Activity className="w-3.5 h-3.5 text-white" />
           </span>
-          <span className="text-[12px] font-semibold tracking-wide text-white">CareOne AI Health Assistant</span>
+          <span className="text-[13px] font-semibold text-[#1d1d1f]">CareOne Health Assistant</span>
           {geminiConfigured !== null && (
             <span
-              className={`text-[11px] font-mono-tabular px-2 py-0.5 rounded-full ${
-                geminiConfigured
-                  ? 'bg-[#00ffaa]/15 text-[#00ffaa]'
-                  : 'bg-[#00b1ff]/15 text-[#00b1ff]'
+              className={`text-[11px] font-medium px-2 py-0.5 rounded-md ${
+                geminiConfigured ? 'bg-[#ECFDF3] text-[#067647]' : 'bg-[#FEF3C7] text-[#B45309]'
               }`}
             >
-              {geminiConfigured ? 'Gemini Connected' : 'Awaiting Gemini Key'}
+              {geminiConfigured ? 'Live AI Ready' : 'AI Setup Pending'}
             </span>
           )}
         </div>
@@ -275,31 +475,28 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
           <button
             type="button"
             onClick={handleReset}
-            className="obs-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[12px]"
+            className="mac-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[12px]"
           >
-            <RotateCcw className="w-3.5 h-3.5 text-[#00b1ff]" />
+            <RotateCcw className="w-3.5 h-3.5 text-[#0071e3]" />
             <span>New Conversation</span>
           </button>
         )}
       </div>
 
-      {/* Welcoming Hero (First Screen After Login) */}
       {!hasConversation && (
-        <div className="obs-card relative overflow-hidden p-7 sm:p-10 space-y-6">
-          <div className="space-y-2.5 max-w-2xl">
-            <p className="text-[14px] font-medium text-[#00ffaa] tracking-wide">
-              Hello, {firstName}
-            </p>
-            <h1 className="text-[28px] sm:text-[36px] font-semibold leading-[1.15] text-white">
+        <div className="glass-card p-7 sm:p-9 space-y-6">
+          <div className="space-y-2 max-w-2xl">
+            <p className="text-[14px] font-medium text-[#0071e3]">Hello, {firstName}</p>
+            <h1 className="text-[28px] sm:text-[34px] font-semibold leading-[1.15] text-[#1d1d1f]">
               How can we help you today?
             </h1>
-            <p className="text-[15px] sm:text-[16px] text-[#b0b3d6] leading-relaxed">
-              Tell us what you're experiencing. Let's understand your concern together.
+            <p className="text-[15px] text-[#6e6e73] leading-relaxed">
+              Tell us what you&apos;re experiencing. Let&apos;s understand your concern together and connect you with verified CareOne doctors.
             </p>
           </div>
 
           <div className="space-y-2.5">
-            <p className="text-[12px] font-medium uppercase tracking-wider text-[#8f93c4]">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-[#86868b]">
               Suggested conversation starters
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -308,12 +505,12 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                   key={starter}
                   type="button"
                   onClick={() => void sendMessage(starter)}
-                  className="text-left px-4 py-3 rounded-xl bg-[#16165c]/80 border border-white/12 hover:border-[#00b1ff]/60 hover:bg-[#16165c] transition-all flex items-center justify-between gap-3 group"
+                  className="text-left px-4 py-3 rounded-xl bg-[#f5f5f7]/80 border border-black/[0.07] hover:border-[#0071e3]/45 hover:bg-white transition-all flex items-center justify-between gap-3 group"
                 >
-                  <span className="text-[14px] font-medium text-white group-hover:text-[#00b1ff] transition-colors">
+                  <span className="text-[14px] font-medium text-[#1d1d1f] group-hover:text-[#0071e3] transition-colors">
                     {starter}
                   </span>
-                  <ArrowRight className="w-4 h-4 text-[#8f93c4] group-hover:text-[#00ffaa] shrink-0 transition-colors" />
+                  <ArrowRight className="w-4 h-4 text-[#86868b] group-hover:text-[#0071e3] shrink-0 transition-colors" />
                 </button>
               ))}
             </div>
@@ -321,14 +518,13 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
         </div>
       )}
 
-      {/* Conversational Thread */}
       {hasConversation && (
         <div className="space-y-4">
           {messages.map((turn) => {
             if (turn.role === 'user') {
               return (
                 <div key={turn.id} className="flex justify-end">
-                  <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-br-sm bg-[#5350cc] border border-[#00b1ff]/35 px-4 py-3 text-white shadow-lg">
+                  <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-br-sm bg-[#0071e3] px-4 py-3 text-white shadow-xs">
                     <p className="text-[14px] leading-relaxed whitespace-pre-wrap">{turn.content}</p>
                   </div>
                 </div>
@@ -338,20 +534,17 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
             if (turn.role === 'integration_notice') {
               return (
                 <div key={turn.id} className="flex justify-start">
-                  <div className="w-full max-w-2xl rounded-2xl bg-[#232269] border border-[#00b1ff]/45 p-5 space-y-3 shadow-lg">
-                    <div className="flex items-center gap-2 text-[#00b1ff]">
+                  <div className="w-full max-w-2xl glass-card !p-5 space-y-3 border-amber-200">
+                    <div className="flex items-center gap-2 text-[#b45309]">
                       <Sparkles className="w-4 h-4 shrink-0" />
-                      <span className="text-[13px] font-semibold">Backend Gemini Integration Point Ready</span>
+                      <span className="text-[13px] font-semibold">Assistant Temporarily Unavailable</span>
                     </div>
-                    <p className="text-[13px] text-[#e2e4f6] leading-relaxed">{turn.content}</p>
-                    <p className="text-[12px] font-mono-tabular text-[#b0b3d6] bg-[#16165c] px-3 py-2 rounded-lg border border-white/10">
-                      Endpoint: POST {turn.endpoint || '/api/ai/assistant'} (server/routes/ai.routes.ts)
-                    </p>
+                    <p className="text-[13px] text-[#6e6e73] leading-relaxed">{turn.content}</p>
                     <div className="flex flex-wrap gap-2 pt-1">
                       <button
                         type="button"
                         onClick={() => onNavigate('doctors')}
-                        className="obs-btn-primary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-primary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
                         <Stethoscope className="w-3.5 h-3.5" />
                         <span>Find a Doctor</span>
@@ -359,15 +552,15 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                       <button
                         type="button"
                         onClick={() => onNavigate('doctors', { focusHospitals: true })}
-                        className="obs-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
-                        <Building2 className="w-3.5 h-3.5 text-[#00b1ff]" />
-                        <span>View Nearby Hospitals</span>
+                        <Building2 className="w-3.5 h-3.5 text-[#0071e3]" />
+                        <span>View Hospitals</span>
                       </button>
                       <button
                         type="button"
                         onClick={() => onNavigate('emergency')}
-                        className="obs-btn-danger inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-danger inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
                         <Ambulance className="w-3.5 h-3.5" />
                         <span>Emergency Assistance</span>
@@ -382,23 +575,32 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
 
             return (
               <div key={turn.id} className="flex flex-col items-start gap-3">
-                <div className="max-w-[90%] sm:max-w-[82%] rounded-2xl rounded-bl-sm bg-[#232269] border border-white/12 px-5 py-3.5 text-white shadow-lg">
+                <div className="max-w-[90%] sm:max-w-[82%] glass-card !p-4 sm:!p-5 rounded-2xl rounded-bl-sm">
                   <div className="flex items-center gap-2 mb-1.5">
-                    <Sparkles className="w-3.5 h-3.5 text-[#00ffaa]" />
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-[#00b1ff]">
+                    <Sparkles className={`w-3.5 h-3.5 text-[#0071e3] ${turn.streaming ? 'animate-pulse' : ''}`} />
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-[#0071e3]">
                       CareOne Assistant
                     </span>
                   </div>
-                  <p className="text-[14px] leading-relaxed text-[#f3f4ff] whitespace-pre-wrap">{turn.content}</p>
+                  {turn.content ? (
+                    <p className="text-[14px] leading-relaxed text-[#1d1d1f] whitespace-pre-wrap">
+                      {turn.content}
+                      {turn.streaming && (
+                        <span className="inline-block w-1.5 h-4 ml-1 bg-[#0071e3] align-middle animate-pulse" />
+                      )}
+                    </p>
+                  ) : (
+                    <p className="text-[13px] text-[#6e6e73]">Thinking...</p>
+                  )}
                 </div>
 
                 {isEmergency && (
-                  <div className="w-full max-w-2xl rounded-2xl bg-[#3d172e] border border-[#ff6b6b]/60 p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="w-full max-w-2xl rounded-2xl bg-red-50 border border-red-200 p-4 flex flex-wrap items-center justify-between gap-3">
                     <div className="flex items-start gap-2.5">
-                      <AlertTriangle className="w-5 h-5 text-[#ff6b6b] shrink-0 mt-0.5" />
+                      <AlertTriangle className="w-5 h-5 text-[#dc2626] shrink-0 mt-0.5" />
                       <div>
-                        <p className="text-[13px] font-semibold text-white">Urgent Medical Attention Recommended</p>
-                        <p className="text-[12px] text-[#ffd6d6] mt-0.5">
+                        <p className="text-[13px] font-semibold text-[#991b1b]">Urgent Medical Attention Recommended</p>
+                        <p className="text-[12px] text-[#7f1d1d] mt-0.5">
                           {turn.summary?.emergency_warning ||
                             'Some symptoms you described may require prompt emergency evaluation.'}
                         </p>
@@ -407,7 +609,7 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                     <button
                       type="button"
                       onClick={() => onNavigate('emergency')}
-                      className="obs-btn-danger inline-flex items-center gap-1.5 px-4 py-2 text-[12px] shrink-0"
+                      className="mac-btn-danger inline-flex items-center gap-1.5 px-4 py-2 text-[12px] shrink-0"
                     >
                       <Ambulance className="w-3.5 h-3.5" />
                       <span>Emergency Assistance</span>
@@ -416,28 +618,28 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                 )}
 
                 {turn.summary && (
-                  <div className="w-full max-w-2xl obs-card p-5 space-y-4 border-[#00b1ff]/35">
+                  <div className="w-full max-w-2xl glass-card !p-5 space-y-4">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
-                        <CheckCircle2 className="w-4 h-4 text-[#00ffaa]" />
-                        <h3 className="text-[15px] font-semibold text-white">Summary of Your Concern</h3>
+                        <CheckCircle2 className="w-4 h-4 text-[#15803d]" />
+                        <h3 className="text-[15px] font-semibold text-[#1d1d1f]">Summary of Your Concern</h3>
                       </div>
                       {turn.summary.suggested_specialist && (
-                        <span className="text-[12px] font-medium px-3 py-1 rounded-full bg-[#5350cc]/50 border border-[#00b1ff]/40 text-[#00ffaa]">
+                        <span className="text-[12px] font-medium px-2.5 py-1 rounded-lg bg-[#0071e3]/10 text-[#0071e3]">
                           Suggested Specialist: {turn.summary.suggested_specialist}
                         </span>
                       )}
                     </div>
 
                     {turn.summary.concern_overview && (
-                      <p className="text-[13px] text-[#e2e4f6] leading-relaxed">{turn.summary.concern_overview}</p>
+                      <p className="text-[13px] text-[#1d1d1f] leading-relaxed">{turn.summary.concern_overview}</p>
                     )}
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[12px]">
                       {turn.summary.symptoms_mentioned && turn.summary.symptoms_mentioned.length > 0 && (
-                        <div className="obs-card-inset p-3 space-y-1.5">
-                          <p className="font-semibold text-[#00b1ff]">Symptoms Mentioned</p>
-                          <ul className="space-y-1 text-[#d7d9f2]">
+                        <div className="glass-surface-inset p-3.5 space-y-1.5">
+                          <p className="font-semibold text-[#1d1d1f]">Symptoms Mentioned</p>
+                          <ul className="space-y-1 text-[#6e6e73]">
                             {turn.summary.symptoms_mentioned.map((sym, idx) => (
                               <li key={idx}>• {sym}</li>
                             ))}
@@ -445,21 +647,21 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                         </div>
                       )}
 
-                      <div className="obs-card-inset p-3 space-y-1.5">
-                        <p className="font-semibold text-[#00b1ff]">Assessment & Next Steps</p>
+                      <div className="glass-surface-inset p-3.5 space-y-1.5">
+                        <p className="font-semibold text-[#1d1d1f]">Assessment & Next Steps</p>
                         {turn.summary.duration_and_severity && (
-                          <p className="text-[#d7d9f2]">
-                            <span className="text-[#8f93c4]">Timeline/Severity:</span>{' '}
+                          <p className="text-[#6e6e73]">
+                            <span className="font-medium text-[#1d1d1f]">Timeline/Severity:</span>{' '}
                             {turn.summary.duration_and_severity}
                           </p>
                         )}
-                        <p className="text-[#00ffaa] font-medium">
+                        <p className="text-[#15803d] font-medium">
                           {turn.summary.consultation_advised
                             ? 'Doctor consultation is advisable.'
                             : 'Monitor closely; consult a doctor if symptoms worsen.'}
                         </p>
                         {turn.summary.next_steps && turn.summary.next_steps.length > 0 && (
-                          <ul className="space-y-1 text-[#d7d9f2] pt-0.5">
+                          <ul className="space-y-1 text-[#6e6e73] pt-0.5">
                             {turn.summary.next_steps.map((step, idx) => (
                               <li key={idx}>• {step}</li>
                             ))}
@@ -468,7 +670,47 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                       </div>
                     </div>
 
-                    <div className="pt-2 border-t border-white/10 flex flex-wrap gap-2">
+                    {turn.recommended_doctors && turn.recommended_doctors.length > 0 ? (
+                      <div className="pt-3 border-t border-black/[0.07] space-y-3">
+                        <p className="text-[13px] font-semibold text-[#1d1d1f]">
+                          Verified CareOne Specialists Available to Book
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          {turn.recommended_doctors.map((doc) => (
+                            <div
+                              key={doc.uid}
+                              className="glass-surface-inset p-3.5 space-y-2 flex flex-col justify-between"
+                            >
+                              <div>
+                                <div className="flex items-start justify-between gap-2">
+                                  <p className="text-[14px] font-semibold text-[#1d1d1f]">{doc.fullName}</p>
+                                  <span className="text-[12px] font-mono-tabular font-medium text-[#0071e3]">
+                                    INR {doc.consultationFee}
+                                  </span>
+                                </div>
+                                <p className="text-[12px] font-medium text-[#15803d] mt-0.5">{doc.specialization}</p>
+                                <p className="text-[11px] text-[#6e6e73] truncate mt-1">
+                                  {doc.hospitalName || 'Independent Practice'}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => onBookDoctor?.(doc, turn.summary)}
+                                className="mac-btn-primary w-full py-1.5 text-[12px] mt-1"
+                              >
+                                Book Appointment
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="pt-3 border-t border-black/[0.07] text-[12px] text-[#6e6e73]">
+                        No verified doctors matching &ldquo;{turn.summary.suggested_specialist || 'this specialty'}&rdquo; are currently active on the directory. Check &ldquo;Find a Doctor&rdquo; as verified doctors join.
+                      </div>
+                    )}
+
+                    <div className="pt-2 border-t border-black/[0.07] flex flex-wrap gap-2">
                       <button
                         type="button"
                         onClick={() =>
@@ -476,7 +718,7 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                             specialization: turn.summary?.suggested_specialist,
                           })
                         }
-                        className="obs-btn-primary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-primary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
                         <Stethoscope className="w-3.5 h-3.5" />
                         <span>Find a Doctor</span>
@@ -488,10 +730,10 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                             specialization: turn.summary?.suggested_specialist,
                           })
                         }
-                        className="obs-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
-                        <CalendarClock className="w-3.5 h-3.5 text-[#00ffaa]" />
-                        <span>Book an Appointment</span>
+                        <CalendarClock className="w-3.5 h-3.5 text-[#0071e3]" />
+                        <span>Browse Slots</span>
                       </button>
                       <button
                         type="button"
@@ -501,18 +743,18 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
                             videoOnly: true,
                           })
                         }
-                        className="obs-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
-                        <Video className="w-3.5 h-3.5 text-[#00b1ff]" />
-                        <span>Start Video Consultation</span>
+                        <Video className="w-3.5 h-3.5 text-[#0071e3]" />
+                        <span>Video Consultation</span>
                       </button>
                       <button
                         type="button"
                         onClick={() => onNavigate('doctors', { focusHospitals: true })}
-                        className="obs-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                        className="mac-btn-secondary inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
                       >
-                        <Building2 className="w-3.5 h-3.5 text-[#00b1ff]" />
-                        <span>View Nearby Hospitals</span>
+                        <Building2 className="w-3.5 h-3.5 text-[#0071e3]" />
+                        <span>View Hospitals</span>
                       </button>
                     </div>
                   </div>
@@ -521,21 +763,11 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
             );
           })}
 
-          {sending && (
-            <div className="flex justify-start">
-              <div className="rounded-2xl rounded-bl-sm bg-[#232269] border border-white/12 px-4 py-3 text-[13px] text-[#b0b3d6] flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-[#00b1ff] animate-pulse" />
-                <span>Understanding your concern...</span>
-              </div>
-            </div>
-          )}
-
           <div ref={threadEndRef} />
         </div>
       )}
 
-      {/* Large Conversational Input Box */}
-      <form onSubmit={handleSubmit} className="obs-card p-4 sm:p-5 space-y-3 border-[#5350cc]/50">
+      <form onSubmit={handleSubmit} className="glass-card !p-4 sm:!p-5 space-y-3">
         <label htmlFor="careone-symptom-input" className="sr-only">
           Describe your health problem or symptoms
         </label>
@@ -546,48 +778,43 @@ export function AIHealthAssistant({ patientName, onNavigate }: AIHealthAssistant
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Describe your health problem or symptoms..."
-          className="w-full px-4 py-3 obs-input text-[15px] leading-relaxed resize-none"
+          className="w-full px-4 py-3 glass-input text-[15px] leading-relaxed resize-none"
         />
 
-        {voiceFeedback && (
-          <p className="text-[12px] text-[#00b1ff]">{voiceFeedback}</p>
-        )}
+        {voiceFeedback && <p className="text-[12px] text-[#0071e3]">{voiceFeedback}</p>}
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={toggleVoiceInput}
-              title={speechSupported ? 'Voice input' : 'Voice input unsupported in this browser'}
-              className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px] rounded-xl border transition-colors ${
-                listening
-                  ? 'bg-[#00b1ff]/20 border-[#00b1ff] text-[#00ffaa]'
-                  : 'obs-btn-secondary text-[#b0b3d6]'
-              }`}
-            >
-              {listening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4 text-[#00b1ff]" />}
-              <span>{listening ? 'Stop Listening' : 'Voice Input'}</span>
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={toggleVoiceInput}
+            title={speechSupported ? 'Voice input' : 'Voice input unsupported in this browser'}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-[12px] rounded-xl border transition-colors ${
+              listening
+                ? 'bg-[#0071e3]/10 border-[#0071e3] text-[#0071e3] font-medium'
+                : 'mac-btn-secondary text-[#6e6e73]'
+            }`}
+          >
+            {listening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4 text-[#0071e3]" />}
+            <span>{listening ? 'Stop Listening' : 'Voice Input'}</span>
+          </button>
 
           <button
             type="submit"
             disabled={sending || !input.trim()}
-            className="obs-btn-primary inline-flex items-center gap-2 px-5 py-2.5 text-[13px] disabled:opacity-45"
+            className="mac-btn-primary inline-flex items-center gap-2 px-5 py-2.5 text-[13px] disabled:opacity-45"
           >
-            <span>{sending ? 'Sending...' : 'Send'}</span>
+            <span>{sending ? 'Replying...' : 'Send'}</span>
             <Send className="w-3.5 h-3.5" />
           </button>
         </div>
       </form>
 
-      {/* Safety Notice */}
-      <p className="text-center text-[12px] text-[#8f93c4]">
+      <p className="text-center text-[12px] text-[#86868b]">
         CareOne AI provides general health guidance only and does not provide a confirmed diagnosis, replace a doctor, or prescribe medication. For emergencies, use{' '}
         <button
           type="button"
           onClick={() => onNavigate('emergency')}
-          className="text-[#00b1ff] hover:text-[#00ffaa] underline font-medium"
+          className="text-[#0071e3] hover:underline font-medium"
         >
           Emergency Assistance
         </button>
