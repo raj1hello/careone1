@@ -1,0 +1,6 @@
+{
+  "name": "CareOne",
+  "description": "Integrated Healthcare Management Platform connecting Patients, Doctors, Hospitals, and Pharmacies.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
